@@ -17,4 +17,4 @@ name = "paned"
 path = "src/bin/paned.rs"
 
 [dependencies]
-floem = { path = "../floem" }
+floem = { path = "../floem", features = ["vello"] }

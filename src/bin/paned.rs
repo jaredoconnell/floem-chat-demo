@@ -18,11 +18,15 @@ const PANE_SPACING: f64 = 8.0;
 const TOOLBAR_HEIGHT: f64 = 48.0;
 const PANE_HEADER_HEIGHT: f64 = 36.0;
 const UNDOCK_THRESHOLD: f64 = 40.0;
+/// Minimum total pointer displacement before a click becomes a drag.
+const DRAG_DEAD_ZONE: f64 = 5.0;
 const WINDOW_HEIGHT: f64 = 700.0;
 const RESIZE_HANDLE_WIDTH: f64 = 4.0;
 const MIN_PANE_WIDTH: f64 = 120.0;
-/// How much of a stacked pane's edge is visible in the card-stack.
-const PEEK_WIDTH: f64 = 40.0;
+/// Collapsed (header-only) panes can be resized narrower than normal.
+const COLLAPSED_MIN_WIDTH: f64 = 60.0;
+/// How much of a stacked pane's tab strip is visible in the card-stack.
+const PEEK_WIDTH: f64 = 28.0;
 /// Minimum px/frame the animation moves (prevents crawling to a halt).
 const MIN_ANIM_SPEED: f64 = 12.0;
 /// Proportion of remaining distance moved each frame (ease-out).
@@ -74,8 +78,8 @@ struct PaneState {
     /// Stable insertion order; lower = further right (older panes stay right,
     /// new panes appear to the left).
     dock_order: usize,
-    /// True when this pane is compressed into a peek strip at a window edge.
-    stacked: bool,
+    /// Which edge this pane is compressed into, or None if fully visible.
+    stack_side: Option<StackSide>,
     /// Computed z-index for rendering order. Stacked panes nearest the
     /// visible area get the highest values so they render on top.
     z_order: i32,
@@ -97,10 +101,20 @@ impl std::hash::Hash for PaneState {
 #[derive(Clone, Copy, Debug)]
 struct DragInfo {
     pane_id: usize,
+    start_pointer_x: f64,
+    start_pointer_y: f64,
     last_pointer_x: Option<f64>,
     last_pointer_y: Option<f64>,
-    /// True once the pointer has moved (distinguishes click from drag).
+    /// True once the pointer has moved past DRAG_DEAD_ZONE (distinguishes click from drag).
     moved: bool,
+    /// Tracks the last committed insert position for hysteresis during reorder.
+    last_insert_pos: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StackSide {
+    Left,
+    Right,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -120,6 +134,7 @@ struct ResizeInfo {
 // Card-stack layout helpers
 // ---------------------------------------------------------------------------
 
+
 /// Pack docked panes from the right edge. When the total width exceeds the
 /// window, overflow panes compress into peek strips at the left/right edges
 /// like a fanned deck of cards. `focus_id` determines which pane stays
@@ -129,12 +144,27 @@ fn recompute_dock_targets(
     window_width: f64,
     focus_id: Option<usize>,
 ) {
-    // Collect indices of docked panes sorted by dock_order (ascending).
-    // Lower dock_order = further right (older panes stay on the right).
+    // The browser pane is pinned to the right edge and doesn't participate
+    // in the card-stack layout. Position it first, then lay out the rest
+    // in the remaining space.
+    let browser_idx = panes
+        .iter()
+        .position(|p| p.docked && matches!(p.kind, PaneKind::Browser));
+    let effective_width = if let Some(bi) = browser_idx {
+        let bw = panes[bi].width;
+        panes[bi].target_x = window_width - bw - PANE_SPACING;
+        panes[bi].stack_side = None;
+        panes[bi].z_order = 200;
+        window_width - bw - PANE_SPACING
+    } else {
+        window_width
+    };
+
+    // Collect indices of docked non-browser panes sorted by dock_order.
     let mut docked: Vec<usize> = panes
         .iter()
         .enumerate()
-        .filter(|(_, p)| p.docked)
+        .filter(|(i, p)| p.docked && Some(*i) != browser_idx)
         .map(|(i, _)| i)
         .collect();
     docked.sort_by_key(|&i| panes[i].dock_order);
@@ -144,9 +174,9 @@ fn recompute_dock_targets(
         return;
     }
 
-    // Reset stacked/z_order for all docked panes
+    // Reset stack_side/z_order for all docked panes
     for &i in &docked {
-        panes[i].stacked = false;
+        panes[i].stack_side = None;
         panes[i].z_order = 0;
     }
 
@@ -154,10 +184,9 @@ fn recompute_dock_targets(
     let total: f64 =
         docked.iter().map(|&i| panes[i].width).sum::<f64>() + (n as f64) * PANE_SPACING;
 
-    if total <= window_width {
-        // Everything fits — simple right-packing, lowest dock_order first
-        // (rightmost position).
-        let mut cursor = window_width;
+    if total <= effective_width {
+        // Everything fits — simple right-packing.
+        let mut cursor = effective_width;
         for &i in &docked {
             cursor -= panes[i].width + PANE_SPACING;
             panes[i].target_x = cursor;
@@ -166,7 +195,7 @@ fn recompute_dock_targets(
     }
 
     // --- Overflow: card-stack layout ---
-    assign_card_stack_positions(&docked, panes, window_width, focus_id);
+    assign_card_stack_positions(&docked, panes, effective_width, focus_id);
 }
 
 /// Core card-stack positioning. Determines which panes are fully visible and
@@ -236,44 +265,72 @@ fn assign_card_stack_positions(
     // docked[vis_end+1..] = higher dock_order = leftward in window → LEFT stack
     let right_count = vis_start;
     let left_count = n - vis_end - 1;
-    let right_peek_total = right_count as f64 * PEEK_WIDTH;
-    let left_peek_total = left_count as f64 * PEEK_WIDTH;
 
     // --- Position visible panes: pack from right within the available space ---
     // Visible panes render above stacked peek strips (stacked z tops out
     // around 100 + stack_count, so 200 is safely above).
-    let mut cursor = window_width - right_peek_total;
-    for &i in &docked[vis_start..=vis_end] {
-        cursor -= panes[i].width + PANE_SPACING;
+    // Only add PANE_SPACING between consecutive visible panes.
+    let mut cursor = window_width;
+    for (idx, &i) in docked[vis_start..=vis_end].iter().enumerate() {
+        let spacing = if idx == 0 { 0.0 } else { PANE_SPACING };
+        cursor -= panes[i].width + spacing;
         panes[i].target_x = cursor;
-        panes[i].stacked = false;
+        panes[i].stack_side = None;
         panes[i].z_order = 200;
     }
-    if cursor < left_peek_total {
-        let shift = left_peek_total - cursor;
+    // Shift visible panes so the stacked tabs fit adjacent on both sides.
+    let vis_right_edge = window_width; // rightmost pane's right edge before shift
+    let vis_left_edge = cursor; // leftmost pane's left edge before shift
+    let needed_right = right_count as f64 * PEEK_WIDTH;
+    let needed_left = left_count as f64 * PEEK_WIDTH;
+    let total_needed = needed_left + needed_right
+        + (vis_right_edge - vis_left_edge); // width of visible block
+    if total_needed <= window_width {
+        // Center or right-align the whole block: push visible panes left by
+        // needed_right, then ensure left stacks fit.
+        let shift_for_right = -needed_right;
+        let shifted_left_edge = vis_left_edge + shift_for_right;
+        let shift_for_left = if shifted_left_edge < needed_left {
+            needed_left - shifted_left_edge
+        } else {
+            0.0
+        };
+        let total_shift = shift_for_right + shift_for_left;
         for &i in &docked[vis_start..=vis_end] {
-            panes[i].target_x += shift;
+            panes[i].target_x += total_shift;
+        }
+    } else {
+        // Not enough room even for stacks; just ensure left stacks fit.
+        if cursor < needed_left {
+            let s = needed_left - cursor;
+            for &i in &docked[vis_start..=vis_end] {
+                panes[i].target_x += s;
+            }
         }
     }
 
-    // --- Position right stack (docked[..vis_start], right edge of window) ---
-    // Position by right edge so the RIGHT side of each pane peeks in.
-    // k=0 is outermost (right edge flush with window), k=right_count-1 is
-    // nearest to visible (right edge inset). Nearest renders on top.
-    for (k, &sorted_idx) in docked[..vis_start].iter().enumerate() {
+    // Compute actual edges after shifting
+    let vis_left = panes[docked[vis_end]].target_x;
+    let vis_right = panes[docked[vis_start]].target_x + panes[docked[vis_start]].width;
+
+    // --- Position right stack adjacent to the rightmost visible pane ---
+    // Iterate in reverse so that panes nearest to vis_start (closest in
+    // dock_order to the visible range) are nearest to visible visually.
+    // k=0 nearest to visible (highest z), k=right_count-1 outermost.
+    for (k, &sorted_idx) in docked[..vis_start].iter().rev().enumerate() {
         panes[sorted_idx].target_x =
-            window_width - k as f64 * PEEK_WIDTH - panes[sorted_idx].width;
-        panes[sorted_idx].stacked = true;
-        panes[sorted_idx].z_order = (k + 1) as i32 + 100;
+            vis_right + k as f64 * PEEK_WIDTH - panes[sorted_idx].width + PEEK_WIDTH;
+        panes[sorted_idx].stack_side = Some(StackSide::Right);
+        panes[sorted_idx].z_order = (right_count - k) as i32 + 100;
     }
 
-    // --- Position left stack (docked[vis_end+1..], left edge of window) ---
-    // k=0 is nearest to visible, k=left_count-1 is outermost (highest
-    // dock_order, leftmost). Nearest renders on top.
+    // --- Position left stack adjacent to the leftmost visible pane ---
+    // k=0 nearest to visible (highest z), k=left_count-1 outermost.
     for (k, &sorted_idx) in docked[vis_end + 1..].iter().enumerate() {
-        panes[sorted_idx].target_x =
-            (left_count - 1 - k) as f64 * PEEK_WIDTH;
-        panes[sorted_idx].stacked = true;
+        // Render position should be vis_left - (k+1) * PEEK_WIDTH.
+        // For left-stacked, render_x = target_x.
+        panes[sorted_idx].target_x = vis_left - (k as f64 + 1.0) * PEEK_WIDTH;
+        panes[sorted_idx].stack_side = Some(StackSide::Left);
         panes[sorted_idx].z_order = (left_count - k) as i32 + 100;
     }
 }
@@ -285,6 +342,7 @@ fn recompute_targets_during_drag(
     panes: &mut [PaneState],
     drag_id: usize,
     window_width: f64,
+    last_insert_pos: &mut Option<usize>,
 ) {
     let drag_idx = panes.iter().position(|p| p.id == drag_id);
     let Some(drag_idx) = drag_idx else { return };
@@ -301,11 +359,25 @@ fn recompute_targets_during_drag(
         return;
     }
 
-    // Collect docked panes excluding the dragged one, sorted by dock_order
+    // Pin the browser pane to the right (same as recompute_dock_targets).
+    let browser_idx = panes
+        .iter()
+        .position(|p| p.docked && matches!(p.kind, PaneKind::Browser) && p.id != drag_id);
+    let effective_width = if let Some(bi) = browser_idx {
+        let bw = panes[bi].width;
+        panes[bi].target_x = window_width - bw - PANE_SPACING;
+        panes[bi].stack_side = None;
+        panes[bi].z_order = 200;
+        window_width - bw - PANE_SPACING
+    } else {
+        window_width
+    };
+
+    // Collect docked non-browser panes excluding the dragged one
     let mut others: Vec<usize> = panes
         .iter()
         .enumerate()
-        .filter(|(_, p)| p.docked && p.id != drag_id)
+        .filter(|(i, p)| p.docked && p.id != drag_id && Some(*i) != browser_idx)
         .map(|(i, _)| i)
         .collect();
     others.sort_by_key(|&i| panes[i].dock_order);
@@ -314,16 +386,54 @@ fn recompute_targets_during_drag(
         return;
     }
 
-    // Find where the dragged pane slots in among the others based on its
-    // current x center. Lower indices = rightmost (lower dock_order).
-    let drag_center = panes[drag_idx].x + panes[drag_idx].width / 2.0;
-    let insert_pos = others
-        .iter()
-        .position(|&i| {
-            let other_center = panes[i].target_x + panes[i].width / 2.0;
-            drag_center > other_center
-        })
-        .unwrap_or(others.len());
+    // Reorder using leading-edge threshold: the dragged pane's leading edge
+    // must pass 50% of the neighbor's width to trigger a swap.
+    let drag_left = panes[drag_idx].x;
+    let drag_right = drag_left + panes[drag_idx].width;
+
+    let prev = match *last_insert_pos {
+        Some(p) => p.min(others.len()),
+        None => {
+            // Initial placement: use right edge vs neighbor centers
+            others
+                .iter()
+                .position(|&i| {
+                    drag_right > panes[i].target_x + panes[i].width / 2.0
+                })
+                .unwrap_or(others.len())
+        }
+    };
+
+    let mut insert_pos = prev;
+
+    // Try move RIGHT (decrease pos): drag's right edge passes 50% of right neighbor.
+    // For stacked panes, use the visible strip center instead of full logical center.
+    if prev > 0 {
+        let i = others[prev - 1];
+        let other_center = match panes[i].stack_side {
+            Some(StackSide::Right) => panes[i].target_x + panes[i].width - PEEK_WIDTH / 2.0,
+            Some(StackSide::Left) => panes[i].target_x + PEEK_WIDTH / 2.0,
+            None => panes[i].target_x + panes[i].width / 2.0,
+        };
+        if drag_right > other_center {
+            insert_pos = prev - 1;
+        }
+    }
+
+    // Try move LEFT (increase pos): drag's left edge passes 50% of left neighbor.
+    if insert_pos == prev && prev < others.len() {
+        let i = others[prev];
+        let other_center = match panes[i].stack_side {
+            Some(StackSide::Right) => panes[i].target_x + panes[i].width - PEEK_WIDTH / 2.0,
+            Some(StackSide::Left) => panes[i].target_x + PEEK_WIDTH / 2.0,
+            None => panes[i].target_x + panes[i].width / 2.0,
+        };
+        if drag_left < other_center {
+            insert_pos = prev + 1;
+        }
+    }
+
+    *last_insert_pos = Some(insert_pos);
 
     // Build the full ordered list with the dragged pane inserted
     let mut ordered: Vec<usize> = Vec::with_capacity(others.len() + 1);
@@ -332,9 +442,11 @@ fn recompute_targets_during_drag(
     ordered.extend_from_slice(&others[insert_pos..]);
 
     // Use the card-stack algorithm with the dragged pane as focus
-    assign_card_stack_positions(&ordered, panes, window_width, Some(drag_id));
+    assign_card_stack_positions(&ordered, panes, effective_width, Some(drag_id));
     // The dragged pane's position is mouse-controlled, not layout-controlled
     panes[drag_idx].target_x = panes[drag_idx].x;
+    // Dragged pane always renders on top
+    panes[drag_idx].z_order = 300;
 }
 
 /// After a drag ends, commit the dragged pane's spatial position into the
@@ -346,21 +458,30 @@ fn commit_drag_order(panes: &mut [PaneState], drag_id: usize) {
         return;
     }
 
+    // Exclude the browser pane — it's pinned and doesn't participate in ordering.
     let mut others: Vec<usize> = panes
         .iter()
         .enumerate()
-        .filter(|(_, p)| p.docked && p.id != drag_id)
+        .filter(|(_, p)| {
+            p.docked && p.id != drag_id && !matches!(p.kind, PaneKind::Browser)
+        })
         .map(|(i, _)| i)
         .collect();
     others.sort_by_key(|&i| panes[i].dock_order);
 
-    // Same spatial-insert logic as recompute_targets_during_drag
-    let drag_center = panes[drag_idx].x + panes[drag_idx].width / 2.0;
+    // Leading-edge logic matching recompute_targets_during_drag:
+    // use visible center for stacked panes.
+    let drag_left = panes[drag_idx].x;
+    let drag_right = drag_left + panes[drag_idx].width;
     let insert_pos = others
         .iter()
         .position(|&i| {
-            let other_center = panes[i].target_x + panes[i].width / 2.0;
-            drag_center > other_center
+            let other_center = match panes[i].stack_side {
+                Some(StackSide::Right) => panes[i].target_x + panes[i].width - PEEK_WIDTH / 2.0,
+                Some(StackSide::Left) => panes[i].target_x + PEEK_WIDTH / 2.0,
+                None => panes[i].target_x + panes[i].width / 2.0,
+            };
+            drag_right > other_center
         })
         .unwrap_or(others.len());
 
@@ -380,8 +501,18 @@ fn commit_drag_order(panes: &mut [PaneState], drag_id: usize) {
 // ---------------------------------------------------------------------------
 
 /// Advance each non-dragged pane's `x` toward its `target_x`.
+/// When no drag is active, snaps instantly. During a drag, non-dragged
+/// panes animate smoothly so they slide out of the way.
 /// Returns true if any pane still needs more animation.
 fn tick_animation(panes: &mut [PaneState], drag_id: Option<usize>) -> bool {
+    if drag_id.is_none() {
+        // No drag — snap everything instantly.
+        for pane in panes.iter_mut() {
+            pane.x = pane.target_x;
+        }
+        return false;
+    }
+
     let mut needs_more = false;
     for pane in panes.iter_mut() {
         if Some(pane.id) == drag_id {
@@ -546,16 +677,20 @@ fn toolbar(
     anim_tick: RwSignal<u64>,
     pane_version: RwSignal<u64>,
 ) -> impl IntoView {
-    let has_browser = move || {
-        pane_version.get(); // re-evaluate on structural changes only
-        panes
-            .with_untracked(|p| p.iter().any(|ps| matches!(ps.kind, PaneKind::Browser)))
+    // Show the button when the browser pane is closed OR stacked.
+    let browser_visible = move || {
+        pane_version.get();
+        anim_tick.get();
+        panes.with_untracked(|p| {
+            p.iter()
+                .find(|ps| matches!(ps.kind, PaneKind::Browser))
+                .is_some_and(|ps| ps.stack_side.is_none())
+        })
     };
 
-    // Only visible when the browser pane is closed
     let show_servers_btn = Label::new("☰ Servers")
         .style(move |s| {
-            let vis = !has_browser();
+            let vis = !browser_visible();
             s.padding_horiz(12.0)
                 .padding_vert(6.0)
                 .font_size(14.0)
@@ -571,6 +706,20 @@ fn toolbar(
                 })
         })
         .on_event_stop(listener::Click, move |_, _| {
+            // If the browser pane exists but is stacked, bring it into focus.
+            // Otherwise create a new one.
+            let existing_id = panes.with_untracked(|p| {
+                p.iter()
+                    .find(|ps| matches!(ps.kind, PaneKind::Browser))
+                    .map(|ps| ps.id)
+            });
+            if let Some(eid) = existing_id {
+                focus_pane_id.set(Some(eid));
+                let (ww, _) = window_size.get_untracked();
+                panes.update(|p| recompute_dock_targets(p, ww, Some(eid)));
+                start_animation(panes, dragging, animating, anim_tick);
+                return;
+            }
             let pid = next_pane_id.get_untracked();
             next_pane_id.set(pid + 1);
             let (ww, wh) = window_size.get_untracked();
@@ -587,7 +736,7 @@ fn toolbar(
                     y: wh - DEFAULT_PANE_HEIGHT,
                     collapsed: false,
                     dock_order: pid,
-                    stacked: false,
+                    stack_side: None,
                     z_order: 0,
                 });
                 recompute_dock_targets(p, ww, Some(pid));
@@ -670,9 +819,12 @@ fn pane_card(
         // whether the user dragged or clicked, and whether the pane is stacked.
         dragging.set(Some(DragInfo {
             pane_id,
+            start_pointer_x: 0.0,
+            start_pointer_y: 0.0,
             last_pointer_x: None,
             last_pointer_y: None,
             moved: false,
+            last_insert_pos: None,
         }));
     };
 
@@ -767,13 +919,19 @@ fn pane_card(
             .style(|s| s.width_full().flex_grow(1.0))
             .into_any()
     } else {
-        // Browser pane — clicking a channel opens a chat pane
+        // Browser pane — clicking a channel opens or focuses a chat pane
         let on_open_channel = move |channel_id: usize| {
-            let already = panes
+            let existing_id = panes
                 .get_untracked()
                 .iter()
-                .any(|p| p.kind.channel_id() == Some(channel_id));
-            if already {
+                .find(|p| p.kind.channel_id() == Some(channel_id))
+                .map(|p| p.id);
+            if let Some(eid) = existing_id {
+                // Bring the existing pane into view
+                focus_pane_id.set(Some(eid));
+                let (ww, _) = window_size.get_untracked();
+                panes.update(|p| recompute_dock_targets(p, ww, Some(eid)));
+                start_animation(panes, dragging, animating, anim_tick);
                 return;
             }
             let pid = next_pane_id.get_untracked();
@@ -783,6 +941,13 @@ fn pane_card(
             // stealing it for the newly opened chat pane.
             let fid = focus_pane_id.get_untracked();
             panes.update(|p| {
+                // New panes get dock_order 0 (rightmost, adjacent to browser).
+                // Shift existing non-browser panes up to make room.
+                for existing in p.iter_mut() {
+                    if !matches!(existing.kind, PaneKind::Browser) {
+                        existing.dock_order += 1;
+                    }
+                }
                 p.push(PaneState {
                     id: pid,
                     kind: PaneKind::Chat { channel_id },
@@ -793,8 +958,8 @@ fn pane_card(
                     docked: true,
                     y: wh - DEFAULT_PANE_HEIGHT,
                     collapsed: false,
-                    dock_order: pid,
-                    stacked: false,
+                    dock_order: 0,
+                    stack_side: None,
                     z_order: 0,
                 });
                 recompute_dock_targets(p, ww, fid);
@@ -815,10 +980,112 @@ fn pane_card(
     let clipped_content = Stack::vertical((header, content))
         .style(|s| s.width_full().height_full())
         .clip()
-        // The Clip wrapper needs explicit sizing because the parent
-        // Stack::new defaults to Row direction where width isn't
-        // automatically stretched to the container.
-        .style(|s| s.width_full().height_full());
+        .style(move |s| {
+            anim_tick.get();
+            let is_stacked = panes.with_untracked(|ps| {
+                ps.iter()
+                    .find(|p| p.id == pane_id)
+                    .and_then(|p| p.stack_side)
+                    .is_some()
+            });
+            let base = s.width_full().height_full();
+            if is_stacked {
+                base.display(floem::style::Display::None)
+            } else {
+                base
+            }
+        });
+
+    // Tab overlay shown when the pane is stacked: the same header content
+    // as the top bar, rotated sideways to fit the narrow peek strip.
+    let tab_content = match channel_id_opt {
+        None => Label::new("Servers")
+            .style(|s| {
+                s.font_size(14.0)
+                    .font_weight(floem::text::FontWeight::BOLD)
+                    .color(theme::TEXT_PRIMARY)
+            })
+            .into_any(),
+        Some(cid) => {
+            let server_info: Option<(char, (u8, u8, u8))> = {
+                let chs = channels.get_untracked();
+                let svs = servers.get_untracked();
+                chs.iter()
+                    .find(|c| c.id == cid)
+                    .and_then(|ch| svs.iter().find(|s| s.id == ch.server_id))
+                    .map(|s| (s.icon_letter, s.color_rgb))
+            };
+
+            let channel_label = Label::new({
+                let name = channels
+                    .get_untracked()
+                    .iter()
+                    .find(|c| c.id == cid)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                format!("# {name}")
+            })
+            .style(|s| {
+                s.font_size(14.0)
+                    .font_weight(floem::text::FontWeight::BOLD)
+                    .color(theme::TEXT_PRIMARY)
+            });
+
+            if let Some((letter, (r, g, b))) = server_info {
+                let icon = mini_server_icon(letter, Color::from_rgb8(r, g, b));
+                Stack::horizontal((icon, channel_label))
+                    .style(|s| s.items_center())
+                    .into_any()
+            } else {
+                channel_label.into_any()
+            }
+        }
+    };
+    let tab_overlay = Stack::horizontal((tab_content,))
+        .style(move |s| {
+            // Reactive so the rotation is recomputed when the overlay
+            // transitions from display:none to visible.
+            anim_tick.get();
+            // Left-stacked reads bottom-to-top (-90°),
+            // right-stacked reads top-to-bottom (+90°).
+            let side = panes.with_untracked(|ps| {
+                ps.iter()
+                    .find(|p| p.id == pane_id)
+                    .and_then(|p| p.stack_side)
+            });
+            let angle = match side {
+                Some(StackSide::Right) => 90.0,
+                _ => -90.0,
+            };
+            s.items_center().rotate(angle.deg())
+        })
+        .container()
+        .style(move |s| {
+            anim_tick.get();
+            let side = panes.with_untracked(|ps| {
+                ps.iter()
+                    .find(|p| p.id == pane_id)
+                    .and_then(|p| p.stack_side)
+            });
+            let base = s
+                .absolute()
+                .inset_top(0.0)
+                .inset_bottom(0.0)
+                .inset_left(0.0)
+                .inset_right(0.0)
+                .items_center()
+                .justify_center()
+                .background(theme::PANE_HEADER_BG)
+                .border_radius(8.0)
+                .cursor(CursorStyle::Pointer);
+            match side {
+                Some(_) => base,
+                None => base.display(floem::style::Display::None),
+            }
+        })
+        .on_event_stop(listener::PointerDown, move |_, _| {
+            start_drag();
+        });
 
     // Resize handles sit below the header to avoid conflicting with
     // the drag grip and close button.
@@ -856,7 +1123,7 @@ fn pane_card(
             }));
         });
 
-    Stack::new((clipped_content, left_handle, right_handle))
+    Stack::new((clipped_content, left_handle, right_handle, tab_overlay))
         .style(move |s| {
             // Subscribe to the lightweight tick counter rather than the full
             // pane Vec -- avoids cloning and diffing every animation frame.
@@ -866,16 +1133,25 @@ fn pane_card(
                 ps.iter().find(|p| p.id == pane_id).cloned()
             });
             if let Some(p) = found {
+                let is_stacked = p.stack_side.is_some();
                 let display_height = if p.collapsed {
                     PANE_HEADER_HEIGHT
                 } else {
                     p.height
                 };
                 let top = if p.docked { wh - display_height } else { p.y };
+                // When stacked, shrink the rendered pane to just the peek
+                // strip so only the tab label is visible.
+                let render_width = if is_stacked { PEEK_WIDTH } else { p.width };
+                let render_x = match p.stack_side {
+                    Some(StackSide::Right) => p.x + p.width - PEEK_WIDTH,
+                    Some(StackSide::Left) => p.x,
+                    None => p.x,
+                };
                 s.absolute()
-                    .inset_left(p.x)
+                    .inset_left(render_x)
                     .inset_top(top)
-                    .width(p.width)
+                    .width(render_width)
                     .height(display_height)
                     .background(bg)
                     .border_radius(8.0)
@@ -917,7 +1193,7 @@ fn app_view() -> impl IntoView {
         y: WINDOW_HEIGHT - DEFAULT_PANE_HEIGHT,
         collapsed: false,
         dock_order: 0,
-        stacked: false,
+        stack_side: None,
         z_order: 0,
     }]);
     let next_pane_id = RwSignal::new(1usize);
@@ -929,6 +1205,8 @@ fn app_view() -> impl IntoView {
     // from infrequent structural changes (add/remove pane).
     let anim_tick: RwSignal<u64> = RwSignal::new(0);
     let pane_version: RwSignal<u64> = RwSignal::new(0);
+    // Tracks whether cursor hittest is currently disabled for click-through.
+    let hittest_disabled: RwSignal<bool> = RwSignal::new(false);
 
     let toolbar = toolbar(
         panes, next_pane_id, window_size, dragging, animating, focus_pane_id,
@@ -991,12 +1269,17 @@ fn app_view() -> impl IntoView {
                     let (ww, _) = window_size.get_untracked();
                     panes.update(|p| {
                         if let Some(pane) = p.iter_mut().find(|ps| ps.id == rz.pane_id) {
+                            let min_w = if pane.collapsed {
+                                COLLAPSED_MIN_WIDTH
+                            } else {
+                                MIN_PANE_WIDTH
+                            };
                             match rz.edge {
                                 ResizeEdge::Right => {
-                                    pane.width = (pane.width + dx).max(MIN_PANE_WIDTH);
+                                    pane.width = (pane.width + dx).max(min_w);
                                 }
                                 ResizeEdge::Left => {
-                                    let new_w = (pane.width - dx).max(MIN_PANE_WIDTH);
+                                    let new_w = (pane.width - dx).max(min_w);
                                     let delta = pane.width - new_w;
                                     pane.x += delta;
                                     pane.width = new_w;
@@ -1004,7 +1287,8 @@ fn app_view() -> impl IntoView {
                             }
                         }
                         // Re-pack others while keeping the resized pane in place
-                        recompute_targets_during_drag(p, rz.pane_id, ww);
+                        let mut no_hysteresis = None;
+                        recompute_targets_during_drag(p, rz.pane_id, ww, &mut no_hysteresis);
                         if let Some(pane) = p.iter_mut().find(|ps| ps.id == rz.pane_id) {
                             pane.target_x = pane.x;
                         }
@@ -1019,15 +1303,52 @@ fn app_view() -> impl IntoView {
 
             // --- Drag ---
             if let Some(mut drag) = dragging.get_untracked() {
+                // Stacked panes can't be dragged (only clicked to scroll into view)
+                let is_stacked = panes.with_untracked(|p| {
+                    p.iter()
+                        .find(|ps| ps.id == drag.pane_id)
+                        .is_some_and(|ps| ps.stack_side.is_some())
+                });
+                if is_stacked {
+                    drag.last_pointer_x = Some(pos.x);
+                    drag.last_pointer_y = Some(pos.y);
+                    dragging.set(Some(drag));
+                    return;
+                }
+
+                // Record start position on the first move event
+                if drag.last_pointer_x.is_none() {
+                    drag.start_pointer_x = pos.x;
+                    drag.start_pointer_y = pos.y;
+                }
                 if let (Some(lx), Some(ly)) = (drag.last_pointer_x, drag.last_pointer_y) {
                     let dx = pos.x - lx;
                     let dy = pos.y - ly;
-                    drag.moved = true;
+                    // Only consider it a drag once past the dead zone
+                    if !drag.moved {
+                        let dist = (pos.x - drag.start_pointer_x).abs()
+                            + (pos.y - drag.start_pointer_y).abs();
+                        if dist < DRAG_DEAD_ZONE {
+                            drag.last_pointer_x = Some(pos.x);
+                            drag.last_pointer_y = Some(pos.y);
+                            dragging.set(Some(drag));
+                            return;
+                        }
+                        drag.moved = true;
+                    }
                     let (ww, wh) = window_size.get_untracked();
+                    let is_browser_docked = panes.with_untracked(|p| {
+                        p.iter()
+                            .find(|ps| ps.id == drag.pane_id)
+                            .map_or(false, |ps| matches!(ps.kind, PaneKind::Browser) && ps.docked)
+                    });
                     panes.update(|p| {
                         if let Some(pane) = p.iter_mut().find(|ps| ps.id == drag.pane_id) {
-                            pane.x += dx;
-                            pane.target_x = pane.x;
+                            // Browser pane while docked: only vertical movement (undock/redock)
+                            if !is_browser_docked {
+                                pane.x += dx;
+                                pane.target_x = pane.x;
+                            }
 
                             if pane.docked {
                                 pane.y += dy;
@@ -1046,7 +1367,9 @@ fn app_view() -> impl IntoView {
                                 }
                             }
                         }
-                        recompute_targets_during_drag(p, drag.pane_id, ww);
+                        if !is_browser_docked {
+                            recompute_targets_during_drag(p, drag.pane_id, ww, &mut drag.last_insert_pos);
+                        }
                     });
                     anim_tick.set(anim_tick.get_untracked() + 1);
                     start_animation(panes, dragging, animating, anim_tick);
@@ -1058,21 +1381,38 @@ fn app_view() -> impl IntoView {
             }
 
             // --- Click-through on transparent areas ---
+            // Only toggle hittest when the state actually changes to avoid
+            // redundant OS calls every PointerMove.
             let (_, wh) = window_size.get_untracked();
             let over_toolbar = pos.y <= TOOLBAR_HEIGHT;
-            let over_pane = panes.get_untracked().iter().any(|p| {
-                let dh = if p.collapsed { PANE_HEADER_HEIGHT } else { p.height };
-                let top = if p.docked { wh - dh } else { p.y };
-                pos.x >= p.x
-                    && pos.x <= p.x + p.width
-                    && pos.y >= top
-                    && pos.y <= top + dh
+            let over_pane = panes.with_untracked(|p| {
+                p.iter().any(|ps| {
+                    let dh = if ps.collapsed { PANE_HEADER_HEIGHT } else { ps.height };
+                    let top = if ps.docked { wh - dh } else { ps.y };
+                    pos.x >= ps.x
+                        && pos.x <= ps.x + ps.width
+                        && pos.y >= top
+                        && pos.y <= top + dh
+                })
             });
-            if !over_toolbar && !over_pane {
+            let over_ui = over_toolbar || over_pane;
+            if over_ui && hittest_disabled.get_untracked() {
+                set_cursor_hittest(true);
+                hittest_disabled.set(false);
+            } else if !over_ui && !hittest_disabled.get_untracked() {
                 set_cursor_hittest(false);
+                hittest_disabled.set(true);
+                // Once hittest is disabled, the OS stops delivering pointer
+                // events to this window. Schedule a short re-enable so the
+                // next pointer movement can be re-evaluated.
                 floem::action::exec_after(
-                    std::time::Duration::from_millis(50),
-                    move |_| set_cursor_hittest(true),
+                    std::time::Duration::from_millis(16),
+                    move |_| {
+                        if hittest_disabled.get_untracked() {
+                            set_cursor_hittest(true);
+                            hittest_disabled.set(false);
+                        }
+                    },
                 );
             }
         })
@@ -1115,7 +1455,7 @@ fn app_view() -> impl IntoView {
                         .get_untracked()
                         .iter()
                         .find(|p| p.id == drag.pane_id)
-                        .is_some_and(|p| p.stacked);
+                        .is_some_and(|p| p.stack_side.is_some());
                     if is_stacked {
                         focus_pane_id.set(Some(drag.pane_id));
                         let (ww, _) = window_size.get_untracked();
