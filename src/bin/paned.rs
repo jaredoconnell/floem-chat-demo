@@ -24,11 +24,11 @@ const MIN_PANE_WIDTH: f64 = 120.0;
 /// How much of a stacked pane's edge is visible in the card-stack.
 const PEEK_WIDTH: f64 = 40.0;
 /// Minimum px/frame the animation moves (prevents crawling to a halt).
-const MIN_ANIM_SPEED: f64 = 8.0;
+const MIN_ANIM_SPEED: f64 = 12.0;
 /// Proportion of remaining distance moved each frame (ease-out).
-const ANIM_FACTOR: f64 = 0.20;
+const ANIM_FACTOR: f64 = 0.30;
 /// Below this distance, snap exactly to target.
-const ANIM_SNAP: f64 = 0.5;
+const ANIM_SNAP: f64 = 1.0;
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -413,24 +413,29 @@ fn start_animation(
     panes: RwSignal<Vec<PaneState>>,
     dragging: RwSignal<Option<DragInfo>>,
     animating: RwSignal<bool>,
+    anim_tick: RwSignal<u64>,
 ) {
     if animating.get_untracked() {
         return;
     }
     animating.set(true);
-    schedule_frame(panes, dragging, animating);
+    schedule_frame(panes, dragging, animating, anim_tick);
 }
 
 fn schedule_frame(
     panes: RwSignal<Vec<PaneState>>,
     dragging: RwSignal<Option<DragInfo>>,
     animating: RwSignal<bool>,
+    anim_tick: RwSignal<u64>,
 ) {
     exec_after_animation_frame(move |_| {
         let drag_id = dragging.get_untracked().map(|d| d.pane_id);
         let needs_more = panes.try_update(|p| tick_animation(p, drag_id)).unwrap_or(false);
+        // Bump the tick counter so style closures re-evaluate without
+        // dyn_stack re-diffing the whole pane list.
+        anim_tick.set(anim_tick.get_untracked() + 1);
         if needs_more {
-            schedule_frame(panes, dragging, animating);
+            schedule_frame(panes, dragging, animating, anim_tick);
         } else {
             animating.set(false);
         }
@@ -457,23 +462,44 @@ fn browser_content(
         |s: &Server| s.id,
         move |server: Server| {
             let sid = server.id;
+            let is_active = move || active_server.get() == sid;
+            // Tab-shaped row: active row bridges into the channel list
             icon_circle(
                 server.icon_letter,
                 server.color(),
                 28.0,
-                move || active_server.get() == sid,
+                is_active,
                 move || active_server.set(sid),
             )
+            .container()
+            .style(move |s| {
+                let active = is_active();
+                s.justify_center()
+                    .items_center()
+                    .padding_left(6.0)
+                    .padding_right(6.0)
+                    .padding_vert(3.0)
+                    .border_top_left_radius(6.0)
+                    .border_bottom_left_radius(6.0)
+                    .border_top_right_radius(0.0)
+                    .border_bottom_right_radius(0.0)
+                    .margin_bottom(2.0)
+                    .background(if active {
+                        theme::CHANNEL_SIDEBAR_BG
+                    } else {
+                        Color::TRANSPARENT
+                    })
+            })
         },
     )
-    .style(|s| s.flex_col().row_gap(4.0).padding(4.0).items_center())
+    .style(|s| s.flex_col().padding_top(4.0).items_end())
     .scroll()
     .style(|s| {
-        s.width(40.0)
+        s.width(44.0)
+            .min_width(44.0)
+            .flex_shrink(0.0)
             .height_full()
             .background(theme::SERVER_BAR_BG)
-            .border_right(1.0)
-            .border_color(theme::PANE_BORDER)
     });
 
     let channel_list = dyn_stack(
@@ -517,12 +543,13 @@ fn toolbar(
     dragging: RwSignal<Option<DragInfo>>,
     animating: RwSignal<bool>,
     focus_pane_id: RwSignal<Option<usize>>,
+    anim_tick: RwSignal<u64>,
+    pane_version: RwSignal<u64>,
 ) -> impl IntoView {
     let has_browser = move || {
+        pane_version.get(); // re-evaluate on structural changes only
         panes
-            .get()
-            .iter()
-            .any(|p| matches!(p.kind, PaneKind::Browser))
+            .with_untracked(|p| p.iter().any(|ps| matches!(ps.kind, PaneKind::Browser)))
     };
 
     // Only visible when the browser pane is closed
@@ -565,7 +592,8 @@ fn toolbar(
                 });
                 recompute_dock_targets(p, ww, Some(pid));
             });
-            start_animation(panes, dragging, animating);
+            pane_version.set(pane_version.get_untracked() + 1);
+            start_animation(panes, dragging, animating, anim_tick);
         });
 
     let drag_grip = Label::new("⠿")
@@ -617,6 +645,8 @@ fn pane_card(
     window_size: RwSignal<(f64, f64)>,
     animating: RwSignal<bool>,
     focus_pane_id: RwSignal<Option<usize>>,
+    anim_tick: RwSignal<u64>,
+    pane_version: RwSignal<u64>,
 ) -> impl IntoView {
     let channel_id_opt = kind.channel_id();
 
@@ -631,7 +661,8 @@ fn pane_card(
             p.retain(|ps| ps.id != pane_id);
             recompute_dock_targets(p, ww, fid);
         });
-        start_animation(panes, dragging, animating);
+        pane_version.set(pane_version.get_untracked() + 1);
+        start_animation(panes, dragging, animating, anim_tick);
     };
 
     let start_drag = move || {
@@ -768,7 +799,8 @@ fn pane_card(
                 });
                 recompute_dock_targets(p, ww, fid);
             });
-            start_animation(panes, dragging, animating);
+            pane_version.set(pane_version.get_untracked() + 1);
+            start_animation(panes, dragging, animating, anim_tick);
         };
         browser_content(servers, channels, active_server, panes, on_open_channel).into_any()
     };
@@ -826,9 +858,14 @@ fn pane_card(
 
     Stack::new((clipped_content, left_handle, right_handle))
         .style(move |s| {
+            // Subscribe to the lightweight tick counter rather than the full
+            // pane Vec -- avoids cloning and diffing every animation frame.
+            anim_tick.get();
             let (_, wh) = window_size.get();
-            let current = panes.get();
-            if let Some(p) = current.iter().find(|p| p.id == pane_id) {
+            let found = panes.with_untracked(|ps| {
+                ps.iter().find(|p| p.id == pane_id).cloned()
+            });
+            if let Some(p) = found {
                 let display_height = if p.collapsed {
                     PANE_HEADER_HEIGHT
                 } else {
@@ -888,11 +925,23 @@ fn app_view() -> impl IntoView {
     let resizing: RwSignal<Option<ResizeInfo>> = RwSignal::new(None);
     let animating: RwSignal<bool> = RwSignal::new(false);
     let focus_pane_id: RwSignal<Option<usize>> = RwSignal::new(Some(0));
+    // Lightweight counters that decouple frequent position updates (animation)
+    // from infrequent structural changes (add/remove pane).
+    let anim_tick: RwSignal<u64> = RwSignal::new(0);
+    let pane_version: RwSignal<u64> = RwSignal::new(0);
 
-    let toolbar = toolbar(panes, next_pane_id, window_size, dragging, animating, focus_pane_id);
+    let toolbar = toolbar(
+        panes, next_pane_id, window_size, dragging, animating, focus_pane_id,
+        anim_tick, pane_version,
+    );
 
     let pane_area = dyn_stack(
-        move || panes.get(),
+        move || {
+            // Only re-diff when panes are added or removed, not on every
+            // animation frame.
+            pane_version.get();
+            panes.get_untracked()
+        },
         |ps: &PaneState| ps.id,
         move |ps: PaneState| {
             pane_card(
@@ -910,6 +959,8 @@ fn app_view() -> impl IntoView {
                 window_size,
                 animating,
                 focus_pane_id,
+                anim_tick,
+                pane_version,
             )
         },
     )
@@ -925,7 +976,7 @@ fn app_view() -> impl IntoView {
                 if (old.0 - size.width).abs() > 1.0 {
                     let fid = focus_pane_id.get_untracked();
                     panes.update(|p| recompute_dock_targets(p, size.width, fid));
-                    start_animation(panes, dragging, animating);
+                    start_animation(panes, dragging, animating, anim_tick);
                 }
             },
         )
@@ -958,7 +1009,8 @@ fn app_view() -> impl IntoView {
                             pane.target_x = pane.x;
                         }
                     });
-                    start_animation(panes, dragging, animating);
+                    anim_tick.set(anim_tick.get_untracked() + 1);
+                    start_animation(panes, dragging, animating, anim_tick);
                 }
                 rz.last_x = Some(pos.x);
                 resizing.set(Some(rz));
@@ -996,7 +1048,8 @@ fn app_view() -> impl IntoView {
                         }
                         recompute_targets_during_drag(p, drag.pane_id, ww);
                     });
-                    start_animation(panes, dragging, animating);
+                    anim_tick.set(anim_tick.get_untracked() + 1);
+                    start_animation(panes, dragging, animating, anim_tick);
                 }
                 drag.last_pointer_x = Some(pos.x);
                 drag.last_pointer_y = Some(pos.y);
@@ -1031,7 +1084,7 @@ fn app_view() -> impl IntoView {
                 let fid = focus_pane_id.get_untracked();
                 panes.update(|p| recompute_dock_targets(p, ww, fid));
                 resizing.set(None);
-                start_animation(panes, dragging, animating);
+                start_animation(panes, dragging, animating, anim_tick);
                 return;
             }
 
@@ -1080,7 +1133,7 @@ fn app_view() -> impl IntoView {
                     }
                 }
                 dragging.set(None);
-                start_animation(panes, dragging, animating);
+                start_animation(panes, dragging, animating, anim_tick);
             }
         })
         .window_title(|| "Paned Demo".to_string())

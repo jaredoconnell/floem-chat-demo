@@ -45,27 +45,6 @@ pub fn icon_circle(
 }
 
 // ---------------------------------------------------------------------------
-// Pill indicator — the small white bar beside the active server icon
-// ---------------------------------------------------------------------------
-
-/// A small white rounded pill that appears to the left of the active server.
-pub fn pill_indicator(is_active: impl Fn() -> bool + 'static + Copy) -> impl IntoView {
-    Empty::new()
-        .style(move |s| {
-            let active = is_active();
-            s.width(4.0)
-                .height(if active { 36.0 } else { 8.0 })
-                .border_radius(4.0)
-                .background(if active {
-                    Color::WHITE
-                } else {
-                    Color::TRANSPARENT
-                })
-                .margin_right(4.0)
-        })
-}
-
-// ---------------------------------------------------------------------------
 // Channel item — a `# channel-name` row
 // ---------------------------------------------------------------------------
 
