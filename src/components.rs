@@ -1,8 +1,9 @@
 use floem::prelude::*;
 use floem::style::{Background, CursorStyle, Transition};
 use floem::unit::DurationUnitExt;
-use floem::views::{Decorators, Empty, TextInput, TextInputEnter, svg};
+use floem::views::{ClipExt, Decorators, Empty, TextInput, TextInputEnter};
 
+use crate::avatar::user_avatar;
 use crate::theme;
 
 // ---------------------------------------------------------------------------
@@ -24,7 +25,9 @@ pub fn icon_circle(
     Label::new(letter.to_string())
         .style(move |s| {
             s.width(size)
+                .min_width(size)
                 .height(size)
+                .min_height(size)
                 .justify_center()
                 .items_center()
                 .font_size(size * 0.45)
@@ -142,7 +145,6 @@ pub fn message_row(
     content: String,
     timestamp: String,
     show_header: bool,
-    avatar_svg: String,
 ) -> impl IntoView {
     let row_height = if show_header {
         MSG_HEIGHT_HEADER
@@ -151,8 +153,8 @@ pub fn message_row(
     };
 
     let avatar_col = if show_header {
-        svg(avatar_svg)
-            .style(|s| s.width(32.0).height(32.0).border_radius(16.0).margin_top(2.0))
+        user_avatar(&author)
+            .style(|s| s.margin_top(2.0))
             .into_any()
     } else {
         // Invisible spacer keeping the indent consistent
@@ -179,9 +181,12 @@ pub fn message_row(
     };
 
     let content_label = Label::new(content)
-        .style(|s| s.font_size(14.0).color(theme::TEXT_PRIMARY));
+        .style(|s| s.font_size(14.0).color(theme::TEXT_PRIMARY).text_wrap().width_full());
 
-    let text_col = Stack::vertical((header_row, content_label));
+    // min_width(0) lets the text column shrink below its content width
+    // in the flex row, preventing long messages from expanding the pane.
+    let text_col = Stack::vertical((header_row, content_label))
+        .style(|s| s.min_width(0.0).flex_grow(1.0));
 
     Stack::horizontal((avatar_col, text_col))
         .style(move |s| {
@@ -190,8 +195,13 @@ pub fn message_row(
                 .col_gap(12.0)
                 .padding_left(16.0)
                 .padding_right(16.0)
-                .items_center()
+                .items_start()
+                .padding_top(4.0)
         })
+        // Clip wrapped text that exceeds the fixed row height so it
+        // doesn't bleed into adjacent rows in the virtual list.
+        .clip()
+        .style(move |s| s.width_full().height(row_height))
 }
 
 // ---------------------------------------------------------------------------
@@ -224,5 +234,64 @@ pub fn message_input(
                 .color(theme::TEXT_PRIMARY)
                 .border_radius(8.0)
                 .border(0.0)
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Mini server icon — small non-interactive badge for pane headers
+// ---------------------------------------------------------------------------
+
+/// A small colored circle with a centered letter, used to indicate
+/// which server a chat pane belongs to.
+pub fn mini_server_icon(letter: char, color: Color) -> impl IntoView {
+    Label::new(letter.to_string()).style(move |s| {
+        s.width(18.0)
+            .min_width(18.0)
+            .height(18.0)
+            .min_height(18.0)
+            .border_radius(9.0)
+            .background(color)
+            .color(Color::WHITE)
+            .justify_center()
+            .items_center()
+            .font_size(10.0)
+            .margin_right(6.0)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Pane header — left content + close button, used in paned mode
+// ---------------------------------------------------------------------------
+
+/// Header bar for an individual pane. The caller provides the left-side
+/// content (e.g. a label, an icon + label, etc.) and a close callback.
+pub fn pane_header(
+    left_content: impl IntoView + 'static,
+    on_close: impl Fn() + 'static + Copy,
+) -> impl IntoView {
+    let left = Stack::horizontal((left_content,))
+        .style(|s| s.flex_grow(1.0).items_center().min_width(0.0));
+
+    let close_btn = Label::new("x")
+        .style(|s| {
+            s.font_size(14.0)
+                .color(theme::TEXT_MUTED)
+                .padding(4.0)
+                .border_radius(4.0)
+                .cursor(CursorStyle::Pointer)
+                .hover(|s| s.color(theme::TEXT_PRIMARY).background(theme::HOVER_BG))
+        })
+        .on_event_stop(listener::Click, move |_, _| on_close());
+
+    Stack::horizontal((left, close_btn))
+        .style(|s| {
+            s.width_full()
+                .height(36.0)
+                .padding_left(12.0)
+                .padding_right(8.0)
+                .items_center()
+                .background(theme::PANE_HEADER_BG)
+                .border_bottom(1.0)
+                .border_color(theme::PANE_BORDER)
         })
 }

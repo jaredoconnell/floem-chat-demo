@@ -11,3 +11,8 @@ pub const HOVER_BG: Color = Color::from_rgb8(52, 55, 60);
 pub const ACTIVE_BG: Color = Color::from_rgb8(57, 60, 67);
 pub const HEADER_BORDER: Color = Color::from_rgb8(32, 34, 37);
 pub const DIVIDER: Color = Color::from_rgb8(66, 70, 77);
+
+// Paned mode
+pub const PANE_BORDER: Color = Color::from_rgb8(24, 26, 29);
+pub const PANE_HEADER_BG: Color = Color::from_rgb8(40, 43, 48);
+pub const TOOLBAR_BG: Color = Color::from_rgb8(32, 34, 37);

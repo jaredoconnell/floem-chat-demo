@@ -1,21 +1,20 @@
 use floem::prelude::*;
 
-use crate::avatar::user_avatar_svg;
 use crate::components::{
     header_bar, message_input, message_row, MSG_HEIGHT_CONTINUATION, MSG_HEIGHT_HEADER,
 };
 use crate::data::{Message, VecData};
 use crate::theme;
 
-/// Main chat panel: channel header, scrollable message timeline, and input bar.
+/// Builds the scrollable message list and input bar.
 ///
-/// Has zero knowledge of channels, servers, or the message store — it receives
-/// a flat message list and a send callback.
-pub fn chat_area_panel(
+/// Returned as a tuple so callers can place them in their own layout
+/// alongside a header of their choosing.
+pub fn chat_area_contents(
     channel_name: impl Fn() -> String + 'static + Copy,
     messages: impl Fn() -> Vec<Message> + 'static + Copy,
     on_send: impl Fn(String) + 'static + Copy,
-) -> impl IntoView {
+) -> (impl IntoView, impl IntoView) {
     // Precompute cozy-mode grouping: `show_header` is true when the author
     // differs from the previous message.
     let display_messages = move || -> Vec<(Message, bool)> {
@@ -42,8 +41,7 @@ pub fn chat_area_panel(
         move || VecData(display_messages()),
         |(msg, _): &(Message, bool)| msg.id,
         move |(msg, show_header): (Message, bool)| {
-            let avatar = user_avatar_svg(&msg.author);
-            message_row(msg.author, msg.content, msg.timestamp, show_header, avatar)
+                message_row(msg.author, msg.content, msg.timestamp, show_header)
         },
     )
     // Explicit per-item sizes matching the fixed heights set on message_row,
@@ -63,10 +61,24 @@ pub fn chat_area_panel(
         let _ = channel_name();
         100.0
     })
-    .style(|s| s.flex_grow(1.0).width_full());
+    .style(|s| s.flex_col().flex_basis(0).flex_grow(1.0).min_width(0.0).width_full());
 
     let input = message_input("Message this channel…", wrapped_send)
-        .style(|s| s.padding_horiz(16.0).padding_bottom(16.0).padding_top(0.0).width_full());
+        .style(|s| s.padding_horiz(16.0).padding_bottom(16.0).padding_top(12.0).width_full());
+
+    (message_list, input)
+}
+
+/// Main chat panel: channel header, scrollable message timeline, and input bar.
+///
+/// Has zero knowledge of channels, servers, or the message store — it receives
+/// a flat message list and a send callback.
+pub fn chat_area_panel(
+    channel_name: impl Fn() -> String + 'static + Copy,
+    messages: impl Fn() -> Vec<Message> + 'static + Copy,
+    on_send: impl Fn(String) + 'static + Copy,
+) -> impl IntoView {
+    let (message_list, input) = chat_area_contents(channel_name, messages, on_send);
 
     Stack::vertical((
         header_bar(channel_name, "# "),

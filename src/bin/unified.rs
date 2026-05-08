@@ -1,19 +1,10 @@
-mod avatar;
-mod channel_sidebar;
-mod chat_area;
-mod components;
-mod data;
-mod server_list;
-#[allow(dead_code)]
-mod theme;
-
 use floem::prelude::*;
 use floem::window::WindowConfig;
 
-use crate::channel_sidebar::channel_sidebar_panel;
-use crate::chat_area::chat_area_panel;
-use crate::data::{AppState, Message};
-use crate::server_list::server_list_panel;
+use floem_demo::channel_sidebar::channel_sidebar_panel;
+use floem_demo::chat_area::chat_area_panel;
+use floem_demo::data::{AppState, Message};
+use floem_demo::server_list::server_list_panel;
 
 fn app_view() -> impl IntoView {
     let state = AppState::with_sample_data();
