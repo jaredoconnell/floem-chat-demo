@@ -1,0 +1,20 @@
+[package]
+name = "floem-demo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[lib]
+name = "floem_demo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "unified"
+path = "src/bin/unified.rs"
+
+[[bin]]
+name = "paned"
+path = "src/bin/paned.rs"
+
+[dependencies]
+floem = { path = "../floem" }
