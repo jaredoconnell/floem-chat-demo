@@ -44,21 +44,8 @@ use super::model::*;
 /// crawling when `step` gets tiny. `ANIM_SNAP` snaps to the target
 /// when close enough, preventing sub-pixel jitter.
 ///
-/// When no drag is active, snaps everything instantly (no animation needed
-/// for batch operations like window resize).
-///
 /// Returns true if any pane still needs more animation.
 pub fn tick_animation(panes: &mut [PaneState], drag_id: Option<usize>) -> bool {
-    if drag_id.is_none() {
-        // No drag — snap everything instantly. This is the fast path for
-        // window resize, pane close, and other batch operations where
-        // animation would feel sluggish.
-        for pane in panes.iter_mut() {
-            pane.x = pane.target_x;
-        }
-        return false;
-    }
-
     let mut needs_more = false;
     for pane in panes.iter_mut() {
         // Skip the dragged pane — its position is controlled by the mouse.

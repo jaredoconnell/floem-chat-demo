@@ -213,6 +213,9 @@ pub fn assign_card_stack_positions(
         }
     }
 
+    // --- Position panes given the computed visible range [vis_start, vis_end] ---
+    // Panes outside this range become peek strips at the edges.
+
     // docked[..vis_start] = lower dock_order = rightward in window → RIGHT stack
     // docked[vis_end+1..] = higher dock_order = leftward in window → LEFT stack
     let right_count = vis_start;
@@ -386,8 +389,52 @@ pub fn recompute_targets_during_drag(
     ordered.push(drag_idx);
     ordered.extend_from_slice(&others[insert_pos..]);
 
-    // Use the card-stack algorithm with the dragged pane as focus.
+    // The card-stack algorithm's "prefer rightward expansion" heuristic
+    // produces different visible sets depending on where the focus sits in
+    // the ordered list. This causes stacked panes to unstack (or visible
+    // panes to stack) as insert_pos changes during drag. If that happens,
+    // fall back to a simple linear pack that preserves each pane's stacking
+    // in its natural position. Final stacking is resolved on drag end.
+    let saved_sides: Vec<Option<StackSide>> = others.iter().map(|&i| panes[i].stack_side).collect();
+
     assign_card_stack_positions(&ordered, panes, effective_width, Some(drag_id));
+
+    let visibility_changed = others
+        .iter()
+        .zip(&saved_sides)
+        .any(|(&i, prev)| prev.is_some() != panes[i].stack_side.is_some());
+
+    if visibility_changed {
+        // Linear pack: each pane gets its pre-drag width allocation
+        // (PEEK_WIDTH if stacked, full width if visible) in natural order.
+        let mut cursor = effective_width;
+        for (idx, &pane_idx) in ordered.iter().enumerate() {
+            let spacing = if idx == 0 { 0.0 } else { PANE_SPACING };
+            if pane_idx == drag_idx {
+                cursor -= panes[pane_idx].width + spacing;
+            } else {
+                // ordered is others with drag_idx inserted at insert_pos,
+                // so the corresponding saved_sides index is offset by one
+                // for items after the drag pane.
+                let others_idx = if idx < insert_pos { idx } else { idx - 1 };
+                if let Some(side) = saved_sides[others_idx] {
+                    cursor -= PEEK_WIDTH + spacing;
+                    panes[pane_idx].target_x = match side {
+                        StackSide::Right => cursor - panes[pane_idx].width + PEEK_WIDTH,
+                        StackSide::Left => cursor,
+                    };
+                    panes[pane_idx].stack_side = Some(side);
+                    panes[pane_idx].z_order = 150;
+                } else {
+                    cursor -= panes[pane_idx].width + spacing;
+                    panes[pane_idx].target_x = cursor;
+                    panes[pane_idx].stack_side = None;
+                    panes[pane_idx].z_order = 200;
+                }
+            }
+        }
+    }
+
     // The dragged pane's position is mouse-controlled, not layout-controlled,
     // so snap its target_x to its current x.
     panes[drag_idx].target_x = panes[drag_idx].x;
@@ -458,12 +505,8 @@ pub fn update_input_regions(panes: &[PaneState], window_width: f64, window_heigh
     regions.push(Rect::new(0.0, 0.0, window_width, TOOLBAR_HEIGHT));
     // Each pane gets its own interactive region.
     for ps in panes {
-        let dh = if ps.collapsed {
-            PANE_HEADER_HEIGHT
-        } else {
-            ps.height
-        };
-        let top = if ps.docked { window_height - dh } else { ps.y };
+        let dh = ps.display_height();
+        let top = ps.render_top(window_height);
         regions.push(Rect::new(ps.x, top, ps.x + ps.width, top + dh));
     }
     set_input_regions(Some(regions));

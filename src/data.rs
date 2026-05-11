@@ -239,7 +239,7 @@ fn build_sample_data() -> (
             name: name.to_string(),
         };
         // First channel ("general") gets 300 messages for stress-testing
-        // VirtualStack's virtualized rendering performance.
+        // dyn_stack's non-virtualized rendering performance.
         let count = if i == 0 { 300 } else { 10 };
         messages.insert(channel_id, make_messages(channel_id, count, &mut msg_id));
         channels.push(ch);

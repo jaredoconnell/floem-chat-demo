@@ -87,6 +87,7 @@ fn app_view() -> impl IntoView {
             docked: true,
             y: WINDOW_HEIGHT - DEFAULT_PANE_HEIGHT,
             collapsed: false,
+            uncollapsed_width: 0.0,
             dock_order: 0,
             stack_side: None,
             z_order: 0,
@@ -190,11 +191,7 @@ fn app_view() -> impl IntoView {
                     let (ww, _) = ctx.window_size.get_untracked();
                     ctx.panes.update(|p| {
                         if let Some(pane) = p.iter_mut().find(|ps| ps.id == rz.pane_id) {
-                            let min_w = if pane.collapsed {
-                                COLLAPSED_MIN_WIDTH
-                            } else {
-                                MIN_PANE_WIDTH
-                            };
+                            let min_w = pane.min_resize_width();
                             // Apply horizontal resize based on which edge is being dragged.
                             match rz.edge {
                                 ResizeEdge::Right | ResizeEdge::TopRight => {
@@ -295,8 +292,14 @@ fn app_view() -> impl IntoView {
 
                             // Dock/undock logic based on vertical displacement.
                             if pane.docked {
+                                let dock_y = pane.dock_y(wh);
+                                // pane.y can go stale when display height changes
+                                // (e.g., collapse toggled while docked). Snap it back
+                                // so the undock threshold works from the visual position.
+                                if pane.y < dock_y - UNDOCK_THRESHOLD {
+                                    pane.y = dock_y;
+                                }
                                 pane.y += dy;
-                                let dock_y = wh - pane.height;
                                 // Undock if dragged far enough above the dock position.
                                 if dock_y - pane.y > UNDOCK_THRESHOLD {
                                     pane.docked = false;
@@ -306,7 +309,7 @@ fn app_view() -> impl IntoView {
                                 }
                             } else {
                                 pane.y += dy;
-                                let dock_y = wh - pane.height;
+                                let dock_y = pane.dock_y(wh);
                                 // Re-dock if dragged close to the bottom edge.
                                 if pane.y >= dock_y - PANE_SPACING {
                                     pane.docked = true;
@@ -355,7 +358,7 @@ fn app_view() -> impl IntoView {
                         // dock it automatically.
                         if let Some(pane) = p.iter_mut().find(|ps| ps.id == drag.pane_id) {
                             if !pane.docked {
-                                let dock_y = wh - pane.height;
+                                let dock_y = pane.dock_y(wh);
                                 if pane.y >= dock_y - UNDOCK_THRESHOLD {
                                     pane.docked = true;
                                     pane.y = dock_y;
@@ -384,13 +387,29 @@ fn app_view() -> impl IntoView {
                     } else {
                         // Visible pane: first click focuses, second click collapses.
                         if drag.was_focused {
-                            // Already focused — toggle collapsed state.
+                            // Already focused — toggle collapsed state and width.
+                            let (ww, wh) = ctx.window_size.get_untracked();
                             ctx.panes.update(|p| {
                                 if let Some(pane) =
                                     p.iter_mut().find(|ps| ps.id == drag.pane_id)
                                 {
                                     pane.collapsed = !pane.collapsed;
+                                    if pane.collapsed {
+                                        // Save full width and shrink to collapsed width.
+                                        pane.uncollapsed_width = pane.width;
+                                        pane.width = COLLAPSED_PANE_WIDTH.min(pane.width);
+                                    } else if pane.uncollapsed_width > 0.0 {
+                                        // Restore pre-collapse width.
+                                        pane.width = pane.uncollapsed_width;
+                                        pane.uncollapsed_width = 0.0;
+                                    }
+                                    // Sync pane.y to the new visual dock position so it
+                                    // doesn't go stale (display height changed).
+                                    if pane.docked {
+                                        pane.y = pane.dock_y(wh);
+                                    }
                                 }
+                                recompute_dock_targets(p, ww, Some(drag.pane_id));
                             });
                         } else {
                             // First click on unfocused pane: just focus it

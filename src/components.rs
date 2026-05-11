@@ -26,10 +26,20 @@
 //! - **`Empty::new()`** — a zero-size invisible view used as a spacer or
 //!   placeholder when conditional content should take up no space.
 
+use std::str::FromStr;
+
 use floem::prelude::*;
 use floem::style::{Background, CursorStyle, Transition};
 use floem::unit::DurationUnitExt;
-use floem::views::{ClipExt, Decorators, Empty, TextInput, TextInputEnter};
+use floem::views::editor::command::CommandExecuted;
+use floem::views::editor::core::buffer::rope_text::RopeText;
+use floem::views::editor::core::cursor::{Cursor, CursorAffinity, CursorMode};
+use floem::views::editor::core::editor::EditType;
+use floem::views::editor::core::selection::Selection;
+use floem::views::editor::keypress::KeypressMap;
+use floem::views::editor::text::{SimpleStyling, WrapMethod};
+use floem::views::{Decorators, Empty, TextEditor, text_editor_keys};
+use floem::{Clipboard, Menu};
 
 use crate::avatar::user_avatar;
 use crate::theme;
@@ -177,16 +187,6 @@ pub fn header_bar(
 // Message row — a single chat message with optional cozy-mode header
 // ---------------------------------------------------------------------------
 
-/// Fixed heights so VirtualStack's `item_size_fn` can provide exact values,
-/// avoiding the default `Assume(None)` estimation (which starts at 10px and
-/// only measures a single item, breaking variable-height layouts).
-///
-/// These must match the heights set via `.height()` in `message_row`'s style.
-/// VirtualStack uses these to calculate scroll positions and viewport bounds
-/// without laying out every item.
-pub const MSG_HEIGHT_HEADER: f64 = 54.0;
-pub const MSG_HEIGHT_CONTINUATION: f64 = 22.0;
-
 /// Renders one message. When `show_header` is true, the avatar, author name,
 /// and timestamp are displayed (first message in a cozy group). Otherwise only
 /// the content is shown, indented to align with grouped messages.
@@ -197,23 +197,12 @@ pub const MSG_HEIGHT_CONTINUATION: f64 = 22.0;
 /// types (e.g. `user_avatar(...)` vs `Empty::new()`). Floem views are
 /// statically typed, so we call `.into_any()` on each branch to erase the
 /// concrete type to `AnyView`, allowing both branches to have the same type.
-///
-/// ## `.clip()` for fixed-height rows
-///
-/// Long messages may wrap to more lines than fit in the fixed row height.
-/// `.clip()` prevents overflow text from bleeding into adjacent rows.
-/// This is important for VirtualStack, which positions rows at exact offsets.
 pub fn message_row(
     author: String,
     content: String,
     timestamp: String,
     show_header: bool,
 ) -> impl IntoView {
-    let row_height = if show_header {
-        MSG_HEIGHT_HEADER
-    } else {
-        MSG_HEIGHT_CONTINUATION
-    };
 
     let avatar_col = if show_header {
         user_avatar(&author)
@@ -243,8 +232,22 @@ pub fn message_row(
         Empty::new().style(|s| s.height(0.0)).into_any()
     };
 
+    // Floem only checks the directly-hit (deepest) view for a context
+    // menu, so we attach it to the content label — the leaf the user
+    // actually right-clicks on.
+    let content_for_menu = content.clone();
     let content_label = Label::new(content)
-        .style(|s| s.font_size(14.0).color(theme::TEXT_PRIMARY).text_wrap().width_full());
+        .style(|s| s.font_size(theme::MESSAGE_FONT_SIZE as f32).color(theme::TEXT_PRIMARY).text_wrap().width_full())
+        .context_menu(move || {
+            let content = content_for_menu.clone();
+            Menu::new()
+                .item("Copy Message", move |i| {
+                    let content = content.clone();
+                    i.action(move || {
+                        let _ = Clipboard::set_contents(content.clone());
+                    })
+                })
+        });
 
     // min_width(0) lets the text column shrink below its content width
     // in the flex row, preventing long messages from expanding the pane.
@@ -256,66 +259,118 @@ pub fn message_row(
     Stack::horizontal((avatar_col, text_col))
         .style(move |s| {
             s.width_full()
-                .height(row_height)
                 .col_gap(12.0) // gap between avatar and text columns
                 .padding_left(16.0)
                 .padding_right(16.0)
                 .items_start() // align avatar to top, not center
                 .padding_top(4.0)
         })
-        // Clip wrapped text that exceeds the fixed row height so it
-        // doesn't bleed into adjacent rows in the virtual list.
-        .clip()
-        .style(move |s| s.width_full().height(row_height))
 }
 
 // ---------------------------------------------------------------------------
-// Message input — text field with submit-on-Enter
+// Message input — multi-line editor with submit-on-Enter
 // ---------------------------------------------------------------------------
 
-/// Self-contained text input that manages its own buffer. Calls `on_submit`
-/// with the typed text when Enter is pressed, then clears the buffer.
+/// Multi-line text input for composing chat messages.
 ///
-/// Returns the concrete ``TextInput`` so callers can inspect its ``ViewId``
-/// (e.g. to programmatically focus it via `view_id.request_focus()`).
+/// Returns a ``(TextEditor, RwSignal<usize>)`` tuple: the editor widget
+/// and a reactive line-count signal (document lines, updated on each edit).
+/// Callers use the line-count signal to dynamically size the input area.
 ///
-/// ## `TextInput` and `RwSignal<String>`
+/// ## Key behaviour
 ///
-/// Floem's `TextInput` is bound to an `RwSignal<String>` — the signal
-/// *is* the source of truth for the text content. The widget reads from
-/// and writes to this signal as the user types. To clear the input after
-/// submit, we simply `buffer.set(String::new())`.
+/// - **Enter** submits the message and clears the editor.
+/// - **Shift+Enter** inserts a newline (standard multi-line editing).
+/// - All other keys are handled by the default editor keymap.
 ///
-/// ## `TextInputEnter::listener()`
+/// ## `text_editor_keys` and custom key handling
 ///
-/// This is a custom event type specific to `TextInput`. It fires when
-/// the user presses Enter inside the text field. We use `on_event_stop`
-/// so the Enter keypress doesn't propagate further.
+/// `text_editor_keys(initial_text, handler)` builds a full ``TextEditor``
+/// with a caller-supplied key handler. The handler receives the
+/// ``RwSignal<Editor>`` and the ``KeypressKey`` and returns
+/// ``CommandExecuted::Yes`` if it consumed the event. We intercept bare
+/// Enter for submit and delegate everything else (including Shift+Enter)
+/// to ``KeypressMap::default()``.
 pub fn message_input(
     placeholder: &'static str,
     on_submit: impl Fn(String) + 'static + Copy,
-) -> TextInput {
-    let buffer = RwSignal::new(String::new());
+) -> (TextEditor, RwSignal<usize>) {
+    let line_count = RwSignal::new(1usize);
+    let default_keymap = KeypressMap::default();
+    let enter_key = Key::from_str("Enter").unwrap();
 
-    TextInput::new(buffer)
-        .placeholder(placeholder)
-        .on_event_stop(TextInputEnter::listener(), move |_, _| {
-            let text = buffer.get_untracked();
+    let tab_key = Key::Named(NamedKey::Tab);
+
+    let editor = text_editor_keys("", move |editor_sig, kp| {
+        // Don't consume Tab — let it propagate for focus navigation.
+        if kp.key == tab_key {
+            return CommandExecuted::No;
+        }
+
+        let is_enter = kp.key == enter_key;
+        let has_shift = kp.modifiers.contains(Modifiers::SHIFT);
+
+        if is_enter && !has_shift {
+            // Extract text, submit, and clear the editor.
+            let text = editor_sig.with_untracked(|ed| {
+                let rt = ed.rope_text();
+                let len = rt.len();
+                if len == 0 {
+                    return String::new();
+                }
+                rt.slice_to_cow(0..len).to_string()
+            });
             let trimmed = text.trim().to_string();
             if !trimmed.is_empty() {
                 on_submit(trimmed);
-                buffer.set(String::new());
+                editor_sig.with_untracked(|ed| {
+                    let len = ed.rope_text().len();
+                    if len > 0 {
+                        let sel = Selection::region(0, len, CursorAffinity::Forward);
+                        ed.doc()
+                            .edit(&mut std::iter::once((sel, "")), EditType::DeleteSelection);
+                    }
+                    ed.cursor.set(Cursor {
+                        mode: CursorMode::Insert(Selection::caret(0, CursorAffinity::Forward)),
+                        horiz: None,
+                        motion_mode: None,
+                        history_selections: Vec::new(),
+                    });
+                });
+                line_count.set(1);
             }
-        })
-        .style(|s| {
-            s.width_full()
-                .padding(12.0)
-                .font_size(14.0)
-                .background(theme::INPUT_BG)
-                .color(theme::TEXT_PRIMARY)
-                .border_radius(8.0)
-                .border(0.0)
-        })
+            CommandExecuted::Yes
+        } else {
+            // Shift+Enter inserts a newline via the default keymap;
+            // all other keys are handled normally.
+            default_keymap.handle_keypress(editor_sig, kp)
+        }
+    })
+    .placeholder(placeholder)
+    .styling(
+        SimpleStyling::builder()
+            .font_size(theme::MESSAGE_FONT_SIZE as usize)
+            .build(),
+    )
+    .editor_style(|s| {
+        s.hide_gutter(true)
+            .wrap_method(WrapMethod::EditorWidth)
+            .scroll_beyond_last_line(false)
+            .cursor_color(theme::TEXT_PRIMARY)
+    })
+    // Track visual line count (including soft-wrapped lines) for dynamic height.
+    // Force text layout creation so last_vline() accounts for wrapping.
+    .update(move |on_update| {
+        if let Some(ed) = on_update.editor {
+            for line in 0..ed.num_lines() {
+                ed.text_layout(line);
+            }
+            let visual_lines = ed.last_vline().get() + 1;
+            line_count.set(visual_lines);
+        }
+    });
+
+    (editor, line_count)
 }
 
 // ---------------------------------------------------------------------------

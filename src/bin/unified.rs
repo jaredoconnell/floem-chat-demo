@@ -68,43 +68,42 @@ fn app_view() -> impl IntoView {
     // system whenever the signals they read change.
     let server_name = move || {
         let sid = active_server.get();
-        servers
-            .get()
-            .iter()
-            .find(|s| s.id == sid)
-            .map(|s| s.name.clone())
-            .unwrap_or_default()
+        servers.with(|svs| {
+            svs.iter()
+                .find(|s| s.id == sid)
+                .map(|s| s.name.clone())
+                .unwrap_or_default()
+        })
     };
 
     let filtered_channels = move || {
         let sid = active_server.get();
-        channels
-            .get()
-            .into_iter()
-            .filter(move |c| c.server_id == sid)
-            .collect::<Vec<_>>()
+        channels.with(|chs| {
+            chs.iter()
+                .filter(|c| c.server_id == sid)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
     };
 
     // --- Derived closures for the chat area ---
     let channel_name = move || {
         let cid = active_channel.get();
-        channels
-            .get()
-            .iter()
-            .find(|c| c.id == cid)
-            .map(|c| c.name.clone())
-            .unwrap_or_default()
+        channels.with(|chs| {
+            chs.iter()
+                .find(|c| c.id == cid)
+                .map(|c| c.name.clone())
+                .unwrap_or_default()
+        })
     };
 
     let current_messages = {
         let messages = state.messages;
         move || {
             let cid = active_channel.get();
-            messages
-                .get()
-                .get(&cid)
-                .cloned()
-                .unwrap_or_default()
+            // Borrow the HashMap instead of cloning it; only clone
+            // the Vec for the active channel.
+            messages.with(|m| m.get(&cid).cloned().unwrap_or_default())
         }
     };
 

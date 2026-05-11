@@ -62,6 +62,9 @@ pub const MIN_PANE_WIDTH: f64 = 120.0;
 pub const MIN_PANE_HEIGHT: f64 = 100.0;
 /// Collapsed (header-only) panes can be resized narrower than normal.
 pub const COLLAPSED_MIN_WIDTH: f64 = 60.0;
+/// Width a pane shrinks to when collapsed (header-only). Wide enough
+/// to show the icon, a truncated channel name, and the close button.
+pub const COLLAPSED_PANE_WIDTH: f64 = 140.0;
 /// Corner resize handles are slightly larger for easier targeting.
 pub const CORNER_HANDLE_SIZE: f64 = 8.0;
 /// How much of a stacked pane's tab strip is visible in the card-stack.
@@ -139,6 +142,9 @@ pub struct PaneState {
     /// When true, only the header bar is visible (body is hidden).
     /// Toggled by clicking a focused pane's header.
     pub collapsed: bool,
+    /// Stores the pre-collapse width so it can be restored when uncollapsing.
+    /// 0.0 when the pane is not collapsed (i.e. unused).
+    pub uncollapsed_width: f64,
     /// Stable insertion order; lower = further right, higher = further left.
     /// New pane placement depends on ``OPEN_PANES_LEFT``.
     pub dock_order: usize,
@@ -166,6 +172,63 @@ impl Eq for PaneState {}
 impl std::hash::Hash for PaneState {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.id.hash(state);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Geometry helpers — encapsulate state-dependent sizing
+// ---------------------------------------------------------------------------
+
+impl PaneState {
+    /// Visual height: header-only when collapsed, full content height otherwise.
+    pub fn display_height(&self) -> f64 {
+        if self.collapsed {
+            PANE_HEADER_HEIGHT
+        } else {
+            self.height
+        }
+    }
+
+    /// Y position where this pane's top edge sits when docked to the bottom.
+    pub fn dock_y(&self, window_height: f64) -> f64 {
+        window_height - self.display_height()
+    }
+
+    /// Top edge for rendering: anchored to bottom when docked, free when floating.
+    pub fn render_top(&self, window_height: f64) -> f64 {
+        if self.docked {
+            self.dock_y(window_height)
+        } else {
+            self.y
+        }
+    }
+
+    /// Rendered width: narrow peek strip when stacked, full width otherwise.
+    pub fn render_width(&self) -> f64 {
+        if self.stack_side.is_some() {
+            PEEK_WIDTH
+        } else {
+            self.width
+        }
+    }
+
+    /// Rendered x position, accounting for right-stacked alignment.
+    /// Right-stacked panes show their right edge (the peek strip),
+    /// so the rendered origin shifts rightward by ``width - PEEK_WIDTH``.
+    pub fn render_x(&self) -> f64 {
+        match self.stack_side {
+            Some(StackSide::Right) => self.x + self.width - PEEK_WIDTH,
+            _ => self.x,
+        }
+    }
+
+    /// Minimum width allowed during resize (collapsed panes can go narrower).
+    pub fn min_resize_width(&self) -> f64 {
+        if self.collapsed {
+            COLLAPSED_MIN_WIDTH
+        } else {
+            MIN_PANE_WIDTH
+        }
     }
 }
 

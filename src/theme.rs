@@ -43,6 +43,10 @@ pub const HEADER_BORDER: Color = Color::from_rgb8(4, 4, 6);
 /// Generic divider line color.
 pub const DIVIDER: Color = Color::from_rgb8(30, 30, 40);
 
+/// Font size (in px) for chat message content and the message editor.
+/// Shared so the text the user types matches what appears in the timeline.
+pub const MESSAGE_FONT_SIZE: f64 = 14.0;
+
 // ---------------------------------------------------------------------------
 // Paned mode — additional colors for the floating pane window manager
 // ---------------------------------------------------------------------------

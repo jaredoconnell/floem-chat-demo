@@ -351,6 +351,7 @@ pub fn toolbar(
                     docked: true,
                     y: wh - DEFAULT_PANE_HEIGHT,
                     collapsed: false,
+                    uncollapsed_width: 0.0,
                     dock_order: pid,
                     stack_side: None,
                     z_order: 0,
@@ -578,19 +579,17 @@ pub fn pane_card(
     let content = if let Some(cid) = channel_id_opt {
         // Chat pane: build a message timeline with input bar.
         let channel_name = move || {
-            channels
-                .get()
-                .iter()
-                .find(|c| c.id == cid)
-                .map(|c| c.name.clone())
-                .unwrap_or_default()
+            channels.with(|chs| {
+                chs.iter()
+                    .find(|c| c.id == cid)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default()
+            })
         };
+        // Borrow the HashMap instead of cloning it; only clone
+        // the Vec for the active channel.
         let current_messages = move || {
-            messages
-                .get()
-                .get(&cid)
-                .cloned()
-                .unwrap_or_default()
+            messages.with(|m| m.get(&cid).cloned().unwrap_or_default())
         };
         // Uses the shared `send_message` helper from data.rs, capturing
         // only the signals it needs (not the full AppState).
@@ -600,8 +599,12 @@ pub fn pane_card(
         // Create a focus trigger for this channel's text input.
         let focus_input = RwSignal::new(0u64);
         ctx.focus_triggers.update(|m| { m.insert(cid, focus_input); });
-        let (message_list, input) = chat_area_contents(channel_name, current_messages, on_send, focus_input);
+        let panel_height = RwSignal::new(400.0f64);
+        let (message_list, input) = chat_area_contents(channel_name, current_messages, on_send, focus_input, panel_height);
         Stack::vertical((message_list, input))
+            .on_event_cont(floem::context::LayoutChanged::listener(), move |_cx, change| {
+                panel_height.set(change.new_box.height());
+            })
             .style(|s| s.width_full().flex_grow(1.0))
             .into_any()
     } else {
@@ -620,6 +623,11 @@ pub fn pane_card(
                 ctx.panes.update(|p| {
                     if let Some(pane) = p.iter_mut().find(|ps| ps.id == eid) {
                         pane.collapsed = false;
+                        // Restore pre-collapse width if it was collapsed.
+                        if pane.uncollapsed_width > 0.0 {
+                            pane.width = pane.uncollapsed_width;
+                            pane.uncollapsed_width = 0.0;
+                        }
                     }
                     recompute_dock_targets(p, ww, Some(eid));
                 });
@@ -666,6 +674,7 @@ pub fn pane_card(
                     docked: true,
                     y: wh - DEFAULT_PANE_HEIGHT,
                     collapsed: false,
+                    uncollapsed_width: 0.0,
                     dock_order: new_order,
                     stack_side: None,
                     z_order: 0,
@@ -804,28 +813,11 @@ pub fn pane_card(
                 ps.iter().find(|p| p.id == pane_id).cloned()
             });
             if let Some(p) = found {
-                let is_stacked = p.stack_side.is_some();
-                let display_height = if p.collapsed {
-                    PANE_HEADER_HEIGHT
-                } else {
-                    p.height
-                };
-                // Docked panes anchor to the bottom; floating panes use their y.
-                let top = if p.docked { wh - display_height } else { p.y };
-                // When stacked, shrink the rendered pane to just the peek
-                // strip so only the tab label is visible.
-                let render_width = if is_stacked { PEEK_WIDTH } else { p.width };
-                // Right-stacked panes show their right edge; left-stacked show their left.
-                let render_x = match p.stack_side {
-                    Some(StackSide::Right) => p.x + p.width - PEEK_WIDTH,
-                    Some(StackSide::Left) => p.x,
-                    None => p.x,
-                };
                 s.absolute()
-                    .inset_left(render_x)
-                    .inset_top(top)
-                    .width(render_width)
-                    .height(display_height)
+                    .inset_left(p.render_x())
+                    .inset_top(p.render_top(wh))
+                    .width(p.render_width())
+                    .height(p.display_height())
                     .background(bg)
                     .border_radius(8.0)
                     .border(1.0)
