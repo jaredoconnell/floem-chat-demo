@@ -74,11 +74,18 @@ fn app_view() -> impl IntoView {
         });
     };
 
+    // Bumped on channel selection to focus the chat text input.
+    let focus_input = RwSignal::new(0u64);
+
     // --- Compose the three panels ---
     Stack::horizontal((
-        server_list_panel(servers, active_server, channels, active_channel),
-        channel_sidebar_panel(server_name, filtered_channels, active_channel),
-        chat_area_panel(channel_name, current_messages, on_send),
+        server_list_panel(servers, active_server, channels, active_channel, move |_| {
+            focus_input.update(|v| *v += 1);
+        }),
+        channel_sidebar_panel(server_name, filtered_channels, active_channel, move |_| {
+            focus_input.update(|v| *v += 1);
+        }),
+        chat_area_panel(channel_name, current_messages, on_send, focus_input),
     ))
     .style(|s| s.width_full().height_full())
     .window_title(|| "Discord Demo".to_string())

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use floem::prelude::*;
 
 use crate::components::{
@@ -9,11 +11,16 @@ use crate::theme;
 /// Builds the scrollable message list and input bar.
 ///
 /// Returned as a tuple so callers can place them in their own layout
-/// alongside a header of their choosing.
+/// alongside a header of their choosing. Clicking the message list
+/// focuses the text input for immediate typing.
+///
+/// ``focus_input`` is a reactive signal — bump it to programmatically
+/// focus the text input (e.g. on channel switch or pane selection).
 pub fn chat_area_contents(
     channel_name: impl Fn() -> String + 'static + Copy,
     messages: impl Fn() -> Vec<Message> + 'static + Copy,
     on_send: impl Fn(String) + 'static + Copy,
+    focus_input: RwSignal<u64>,
 ) -> (impl IntoView, impl IntoView) {
     // Precompute cozy-mode grouping: `show_header` is true when the author
     // differs from the previous message.
@@ -63,8 +70,34 @@ pub fn chat_area_contents(
     })
     .style(|s| s.flex_col().flex_basis(0).flex_grow(1.0).min_width(0.0).width_full());
 
-    let input = message_input("Message this channel…", wrapped_send)
+    let input = message_input("Message this channel…", wrapped_send);
+    let input_id = input.view_id();
+    let input = input
         .style(|s| s.padding_horiz(16.0).padding_bottom(16.0).padding_top(12.0).width_full());
+
+    // Clicking the timeline focuses the text input for immediate typing.
+    let message_list = message_list
+        .on_event_cont(listener::PointerDown, move |_, _| {
+            input_id.request_focus();
+        });
+
+    // Focus the text input shortly after mount so the view is in the tree.
+    floem::action::exec_after(Duration::from_millis(50), move |_| {
+        input_id.request_focus();
+    });
+
+    // Reactive style that watches the focus trigger for subsequent bumps
+    // (channel switch, pane selection, etc.).
+    let first_run = RwSignal::new(true);
+    let input = input.style(move |s| {
+        focus_input.get();
+        if first_run.get_untracked() {
+            first_run.set(false);
+        } else {
+            input_id.request_focus();
+        }
+        s
+    });
 
     (message_list, input)
 }
@@ -77,8 +110,9 @@ pub fn chat_area_panel(
     channel_name: impl Fn() -> String + 'static + Copy,
     messages: impl Fn() -> Vec<Message> + 'static + Copy,
     on_send: impl Fn(String) + 'static + Copy,
+    focus_input: RwSignal<u64>,
 ) -> impl IntoView {
-    let (message_list, input) = chat_area_contents(channel_name, messages, on_send);
+    let (message_list, input) = chat_area_contents(channel_name, messages, on_send, focus_input);
 
     Stack::vertical((
         header_bar(channel_name, "# "),

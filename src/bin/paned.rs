@@ -23,8 +23,11 @@ const DRAG_DEAD_ZONE: f64 = 5.0;
 const WINDOW_HEIGHT: f64 = 700.0;
 const RESIZE_HANDLE_WIDTH: f64 = 4.0;
 const MIN_PANE_WIDTH: f64 = 120.0;
+const MIN_PANE_HEIGHT: f64 = 100.0;
 /// Collapsed (header-only) panes can be resized narrower than normal.
 const COLLAPSED_MIN_WIDTH: f64 = 60.0;
+/// Corner resize handles are slightly larger for easier targeting.
+const CORNER_HANDLE_SIZE: f64 = 8.0;
 /// How much of a stacked pane's tab strip is visible in the card-stack.
 const PEEK_WIDTH: f64 = 28.0;
 /// Minimum px/frame the animation moves (prevents crawling to a halt).
@@ -33,6 +36,8 @@ const MIN_ANIM_SPEED: f64 = 12.0;
 const ANIM_FACTOR: f64 = 0.30;
 /// Below this distance, snap exactly to target.
 const ANIM_SNAP: f64 = 1.0;
+/// If true, new panes open to the left of existing panes; otherwise to the right.
+const OPEN_PANES_LEFT: bool = true;
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -75,8 +80,8 @@ struct PaneState {
     y: f64,
     /// When true, only the header bar is visible.
     collapsed: bool,
-    /// Stable insertion order; lower = further right (older panes stay right,
-    /// new panes appear to the left).
+    /// Stable insertion order; lower = further right, higher = further left.
+    /// New pane placement depends on `OPEN_PANES_LEFT`.
     dock_order: usize,
     /// Which edge this pane is compressed into, or None if fully visible.
     stack_side: Option<StackSide>,
@@ -109,6 +114,8 @@ struct DragInfo {
     moved: bool,
     /// Tracks the last committed insert position for hysteresis during reorder.
     last_insert_pos: Option<usize>,
+    /// Whether the pane was already focused before this interaction started.
+    was_focused: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -121,6 +128,9 @@ enum StackSide {
 enum ResizeEdge {
     Left,
     Right,
+    Top,
+    TopLeft,
+    TopRight,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -128,6 +138,7 @@ struct ResizeInfo {
     pane_id: usize,
     edge: ResizeEdge,
     last_x: Option<f64>,
+    last_y: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -757,7 +768,23 @@ fn toolbar(
             floem::action::drag_window();
         });
 
-    Stack::horizontal((drag_grip, show_servers_btn))
+    let close_app_btn = Label::new("x")
+        .style(|s| {
+            s.font_size(16.0)
+                .color(theme::TEXT_MUTED)
+                .padding(6.0)
+                .border_radius(4.0)
+                .cursor(CursorStyle::Pointer)
+                .hover(|s| s.color(theme::TEXT_PRIMARY).background(theme::HOVER_BG))
+        })
+        .on_event_stop(listener::Click, move |_, _| {
+            floem::quit_app();
+        });
+
+    // Spacer pushes the close button to the right edge.
+    let spacer = Empty::new().style(|s| s.flex_grow(1.0));
+
+    Stack::horizontal((drag_grip, show_servers_btn, spacer, close_app_btn))
         .style(|s| {
             s.width_full()
                 .height(TOOLBAR_HEIGHT)
@@ -796,6 +823,7 @@ fn pane_card(
     focus_pane_id: RwSignal<Option<usize>>,
     anim_tick: RwSignal<u64>,
     pane_version: RwSignal<u64>,
+    focus_triggers: RwSignal<HashMap<usize, RwSignal<u64>>>,
 ) -> impl IntoView {
     let channel_id_opt = kind.channel_id();
 
@@ -806,6 +834,9 @@ fn pane_card(
         if fid == Some(pane_id) {
             fid = None; // recompute will fall back to newest
         }
+        if let Some(cid) = channel_id_opt {
+            focus_triggers.update(|m| { m.remove(&cid); });
+        }
         panes.update(|p| {
             p.retain(|ps| ps.id != pane_id);
             recompute_dock_targets(p, ww, fid);
@@ -815,8 +846,9 @@ fn pane_card(
     };
 
     let start_drag = move || {
-        // Don't set focus here; focus is determined on PointerUp based on
-        // whether the user dragged or clicked, and whether the pane is stacked.
+        let was_focused = focus_pane_id.get_untracked() == Some(pane_id);
+        focus_pane_id.set(Some(pane_id));
+        pane_version.set(pane_version.get_untracked() + 1);
         dragging.set(Some(DragInfo {
             pane_id,
             start_pointer_x: 0.0,
@@ -825,6 +857,7 @@ fn pane_card(
             last_pointer_y: None,
             moved: false,
             last_insert_pos: None,
+            was_focused,
         }));
     };
 
@@ -878,6 +911,16 @@ fn pane_card(
 
     let header = pane_header(header_content, on_close)
         .style(|s| s.cursor(CursorStyle::Grab))
+        .style(move |s| {
+            pane_version.get();
+            let focused = focus_pane_id.get_untracked() == Some(pane_id);
+            let bg = if focused {
+                theme::PANE_HEADER_FOCUSED_BG
+            } else {
+                theme::PANE_HEADER_BG
+            };
+            s.background(bg)
+        })
         .on_event_stop(listener::PointerDown, move |_, _| {
             start_drag();
         });
@@ -914,7 +957,9 @@ fn pane_card(
                 m.entry(cid).or_default().push(msg);
             });
         };
-        let (message_list, input) = chat_area_contents(channel_name, current_messages, on_send);
+        let focus_input = RwSignal::new(0u64);
+        focus_triggers.update(|m| { m.insert(cid, focus_input); });
+        let (message_list, input) = chat_area_contents(channel_name, current_messages, on_send, focus_input);
         Stack::vertical((message_list, input))
             .style(|s| s.width_full().flex_grow(1.0))
             .into_any()
@@ -927,27 +972,40 @@ fn pane_card(
                 .find(|p| p.kind.channel_id() == Some(channel_id))
                 .map(|p| p.id);
             if let Some(eid) = existing_id {
-                // Bring the existing pane into view
+                // Bring the existing pane into view and focus its text input.
                 focus_pane_id.set(Some(eid));
                 let (ww, _) = window_size.get_untracked();
                 panes.update(|p| recompute_dock_targets(p, ww, Some(eid)));
+                if let Some(trigger) = focus_triggers.with_untracked(|m| m.get(&channel_id).copied()) {
+                    trigger.update(|v| *v += 1);
+                }
                 start_animation(panes, dragging, animating, anim_tick);
                 return;
             }
             let pid = next_pane_id.get_untracked();
             next_pane_id.set(pid + 1);
             let (ww, wh) = window_size.get_untracked();
-            // Keep focus on the current pane (the browser) rather than
-            // stealing it for the newly opened chat pane.
-            let fid = focus_pane_id.get_untracked();
+            focus_pane_id.set(Some(pid));
             panes.update(|p| {
-                // New panes get dock_order 0 (rightmost, adjacent to browser).
-                // Shift existing non-browser panes up to make room.
-                for existing in p.iter_mut() {
-                    if !matches!(existing.kind, PaneKind::Browser) {
-                        existing.dock_order += 1;
+                let new_order = if OPEN_PANES_LEFT {
+                    // Highest dock_order = leftmost position.
+                    let max = p
+                        .iter()
+                        .filter(|ps| !matches!(ps.kind, PaneKind::Browser))
+                        .map(|ps| ps.dock_order)
+                        .max()
+                        .unwrap_or(0);
+                    max + 1
+                } else {
+                    // dock_order 0 = rightmost (adjacent to browser).
+                    // Shift existing panes left to make room.
+                    for existing in p.iter_mut() {
+                        if !matches!(existing.kind, PaneKind::Browser) {
+                            existing.dock_order += 1;
+                        }
                     }
-                }
+                    0
+                };
                 p.push(PaneState {
                     id: pid,
                     kind: PaneKind::Chat { channel_id },
@@ -958,11 +1016,12 @@ fn pane_card(
                     docked: true,
                     y: wh - DEFAULT_PANE_HEIGHT,
                     collapsed: false,
-                    dock_order: 0,
+                    dock_order: new_order,
                     stack_side: None,
                     z_order: 0,
                 });
-                recompute_dock_targets(p, ww, fid);
+                // Focus the new pane so the card-stack keeps it visible.
+                recompute_dock_targets(p, ww, Some(pid));
             });
             pane_version.set(pane_version.get_untracked() + 1);
             start_animation(panes, dragging, animating, anim_tick);
@@ -979,6 +1038,12 @@ fn pane_card(
 
     let clipped_content = Stack::vertical((header, content))
         .style(|s| s.width_full().height_full())
+        .on_event_cont(listener::PointerDown, move |_, _| {
+            if focus_pane_id.get_untracked() != Some(pane_id) {
+                focus_pane_id.set(Some(pane_id));
+                pane_version.set(pane_version.get_untracked() + 1);
+            }
+        })
         .clip()
         .style(move |s| {
             anim_tick.get();
@@ -1087,8 +1152,9 @@ fn pane_card(
             start_drag();
         });
 
-    // Resize handles sit below the header to avoid conflicting with
-    // the drag grip and close button.
+    // Resize handles: side handles sit below the header to avoid conflicting
+    // with the drag grip and close button; corner and top handles cover the
+    // top edge for vertical resize.
     let left_handle = Empty::new()
         .style(|s| {
             s.absolute()
@@ -1103,6 +1169,7 @@ fn pane_card(
                 pane_id,
                 edge: ResizeEdge::Left,
                 last_x: None,
+                last_y: None,
             }));
         });
 
@@ -1120,10 +1187,73 @@ fn pane_card(
                 pane_id,
                 edge: ResizeEdge::Right,
                 last_x: None,
+                last_y: None,
             }));
         });
 
-    Stack::new((clipped_content, left_handle, right_handle, tab_overlay))
+    let top_handle = Empty::new()
+        .style(|s| {
+            s.absolute()
+                .inset_top(0.0)
+                .inset_left(CORNER_HANDLE_SIZE)
+                .inset_right(CORNER_HANDLE_SIZE)
+                .height(RESIZE_HANDLE_WIDTH)
+                .cursor(CursorStyle::RowResize)
+        })
+        .on_event_stop(listener::PointerDown, move |_, _| {
+            resizing.set(Some(ResizeInfo {
+                pane_id,
+                edge: ResizeEdge::Top,
+                last_x: None,
+                last_y: None,
+            }));
+        });
+
+    let top_left_handle = Empty::new()
+        .style(|s| {
+            s.absolute()
+                .inset_top(0.0)
+                .inset_left(0.0)
+                .width(CORNER_HANDLE_SIZE)
+                .height(CORNER_HANDLE_SIZE)
+                .cursor(CursorStyle::NwResize)
+        })
+        .on_event_stop(listener::PointerDown, move |_, _| {
+            resizing.set(Some(ResizeInfo {
+                pane_id,
+                edge: ResizeEdge::TopLeft,
+                last_x: None,
+                last_y: None,
+            }));
+        });
+
+    let top_right_handle = Empty::new()
+        .style(|s| {
+            s.absolute()
+                .inset_top(0.0)
+                .inset_right(0.0)
+                .width(CORNER_HANDLE_SIZE)
+                .height(CORNER_HANDLE_SIZE)
+                .cursor(CursorStyle::NeResize)
+        })
+        .on_event_stop(listener::PointerDown, move |_, _| {
+            resizing.set(Some(ResizeInfo {
+                pane_id,
+                edge: ResizeEdge::TopRight,
+                last_x: None,
+                last_y: None,
+            }));
+        });
+
+    Stack::new((
+        clipped_content,
+        left_handle,
+        right_handle,
+        top_handle,
+        top_left_handle,
+        top_right_handle,
+        tab_overlay,
+    ))
         .style(move |s| {
             // Subscribe to the lightweight tick counter rather than the full
             // pane Vec -- avoids cloning and diffing every animation frame.
@@ -1207,6 +1337,8 @@ fn app_view() -> impl IntoView {
     let pane_version: RwSignal<u64> = RwSignal::new(0);
     // Tracks whether cursor hittest is currently disabled for click-through.
     let hittest_disabled: RwSignal<bool> = RwSignal::new(false);
+    // Maps channel_id → focus trigger signal so channel clicks can focus the right input.
+    let focus_triggers: RwSignal<HashMap<usize, RwSignal<u64>>> = RwSignal::new(HashMap::new());
 
     let toolbar = toolbar(
         panes, next_pane_id, window_size, dragging, animating, focus_pane_id,
@@ -1239,6 +1371,7 @@ fn app_view() -> impl IntoView {
                 focus_pane_id,
                 anim_tick,
                 pane_version,
+                focus_triggers,
             )
         },
     )
@@ -1264,8 +1397,10 @@ fn app_view() -> impl IntoView {
 
             // --- Resize ---
             if let Some(mut rz) = resizing.get_untracked() {
-                if let Some(lx) = rz.last_x {
-                    let dx = pos.x - lx;
+                let has_prev = rz.last_x.is_some() || rz.last_y.is_some();
+                if has_prev {
+                    let dx = rz.last_x.map(|lx| pos.x - lx).unwrap_or(0.0);
+                    let dy = rz.last_y.map(|ly| pos.y - ly).unwrap_or(0.0);
                     let (ww, _) = window_size.get_untracked();
                     panes.update(|p| {
                         if let Some(pane) = p.iter_mut().find(|ps| ps.id == rz.pane_id) {
@@ -1274,16 +1409,31 @@ fn app_view() -> impl IntoView {
                             } else {
                                 MIN_PANE_WIDTH
                             };
+                            // Horizontal component
                             match rz.edge {
-                                ResizeEdge::Right => {
+                                ResizeEdge::Right | ResizeEdge::TopRight => {
                                     pane.width = (pane.width + dx).max(min_w);
                                 }
-                                ResizeEdge::Left => {
+                                ResizeEdge::Left | ResizeEdge::TopLeft => {
                                     let new_w = (pane.width - dx).max(min_w);
                                     let delta = pane.width - new_w;
                                     pane.x += delta;
                                     pane.width = new_w;
                                 }
+                                ResizeEdge::Top => {}
+                            }
+                            // Vertical component: dragging the top edge up
+                            // increases height (and shifts y for undocked panes).
+                            match rz.edge {
+                                ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight => {
+                                    let new_h = (pane.height - dy).max(MIN_PANE_HEIGHT);
+                                    if !pane.docked {
+                                        let actual_dy = pane.height - new_h;
+                                        pane.y += actual_dy;
+                                    }
+                                    pane.height = new_h;
+                                }
+                                _ => {}
                             }
                         }
                         // Re-pack others while keeping the resized pane in place
@@ -1297,6 +1447,7 @@ fn app_view() -> impl IntoView {
                     start_animation(panes, dragging, animating, anim_tick);
                 }
                 rz.last_x = Some(pos.x);
+                rz.last_y = Some(pos.y);
                 resizing.set(Some(rz));
                 return;
             }
@@ -1463,13 +1614,28 @@ fn app_view() -> impl IntoView {
                             recompute_dock_targets(p, ww, Some(drag.pane_id));
                         });
                     } else {
-                        panes.update(|p| {
-                            if let Some(pane) =
-                                p.iter_mut().find(|ps| ps.id == drag.pane_id)
-                            {
-                                pane.collapsed = !pane.collapsed;
+                        // First click on an unfocused pane just focuses it
+                        // (and its text input); only a second click collapses.
+                        if drag.was_focused {
+                            panes.update(|p| {
+                                if let Some(pane) =
+                                    p.iter_mut().find(|ps| ps.id == drag.pane_id)
+                                {
+                                    pane.collapsed = !pane.collapsed;
+                                }
+                            });
+                        } else {
+                            let cid = panes.with_untracked(|p| {
+                                p.iter()
+                                    .find(|ps| ps.id == drag.pane_id)
+                                    .and_then(|ps| ps.kind.channel_id())
+                            });
+                            if let Some(cid) = cid {
+                                if let Some(trigger) = focus_triggers.with_untracked(|m| m.get(&cid).copied()) {
+                                    trigger.update(|v| *v += 1);
+                                }
                             }
-                        });
+                        }
                     }
                 }
                 dragging.set(None);
@@ -1477,6 +1643,35 @@ fn app_view() -> impl IntoView {
             }
         })
         .window_title(|| "Paned Demo".to_string())
+        .style(|s| s.keyboard_navigable())
+        .on_event_stop(listener::KeyDown, move |_, KeyboardEvent { key, modifiers, .. }| {
+            // Cmd-W (Mac) / Ctrl-W (other) closes the focused pane.
+            #[cfg(target_os = "macos")]
+            let close_mod = Modifiers::META;
+            #[cfg(not(target_os = "macos"))]
+            let close_mod = Modifiers::CONTROL;
+
+            if *key == Key::Character("w".into())
+                && modifiers.contains(close_mod)
+            {
+                if let Some(pid) = focus_pane_id.get_untracked() {
+                    let (ww, _) = window_size.get_untracked();
+                    let new_focus = panes.with_untracked(|p| {
+                        p.iter()
+                            .filter(|ps| ps.id != pid)
+                            .max_by_key(|ps| ps.dock_order)
+                            .map(|ps| ps.id)
+                    });
+                    focus_pane_id.set(new_focus);
+                    panes.update(|p| {
+                        p.retain(|ps| ps.id != pid);
+                        recompute_dock_targets(p, ww, new_focus);
+                    });
+                    pane_version.set(pane_version.get_untracked() + 1);
+                    start_animation(panes, dragging, animating, anim_tick);
+                }
+            }
+        })
 }
 
 fn main() {

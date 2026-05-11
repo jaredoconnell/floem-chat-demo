@@ -1,18 +1,20 @@
 use floem::prelude::*;
 
-pub const SERVER_BAR_BG: Color = Color::from_rgb8(32, 34, 37);
-pub const CHANNEL_SIDEBAR_BG: Color = Color::from_rgb8(47, 49, 54);
-pub const CHAT_BG: Color = Color::from_rgb8(54, 57, 63);
-pub const INPUT_BG: Color = Color::from_rgb8(64, 68, 75);
-pub const TEXT_PRIMARY: Color = Color::from_rgb8(220, 221, 222);
-pub const TEXT_MUTED: Color = Color::from_rgb8(114, 118, 125);
-pub const BLURPLE: Color = Color::from_rgb8(114, 137, 218);
-pub const HOVER_BG: Color = Color::from_rgb8(52, 55, 60);
-pub const ACTIVE_BG: Color = Color::from_rgb8(57, 60, 67);
-pub const HEADER_BORDER: Color = Color::from_rgb8(32, 34, 37);
-pub const DIVIDER: Color = Color::from_rgb8(66, 70, 77);
+pub const SERVER_BAR_BG: Color = Color::from_rgb8(6, 6, 8);
+pub const CHANNEL_SIDEBAR_BG: Color = Color::from_rgb8(16, 16, 22);
+pub const CHAT_BG: Color = Color::from_rgb8(10, 10, 14);
+pub const INPUT_BG: Color = Color::from_rgb8(24, 24, 32);
+pub const TEXT_PRIMARY: Color = Color::from_rgb8(220, 224, 232);
+pub const TEXT_MUTED: Color = Color::from_rgb8(88, 94, 110);
+pub const BLURPLE: Color = Color::from_rgb8(120, 142, 225);
+pub const HOVER_BG: Color = Color::from_rgb8(20, 20, 28);
+pub const ACTIVE_BG: Color = Color::from_rgb8(26, 26, 36);
+pub const HEADER_BORDER: Color = Color::from_rgb8(4, 4, 6);
+pub const DIVIDER: Color = Color::from_rgb8(30, 30, 40);
 
 // Paned mode
-pub const PANE_BORDER: Color = Color::from_rgb8(24, 26, 29);
-pub const PANE_HEADER_BG: Color = Color::from_rgb8(40, 43, 48);
-pub const TOOLBAR_BG: Color = Color::from_rgb8(32, 34, 37);
+pub const PANE_BORDER: Color = Color::from_rgb8(3, 3, 5);
+pub const PANE_HEADER_BG: Color = Color::from_rgb8(19, 19, 26);
+/// Noticeably lighter header for the focused pane.
+pub const PANE_HEADER_FOCUSED_BG: Color = Color::from_rgb8(36, 36, 52);
+pub const TOOLBAR_BG: Color = Color::from_rgb8(8, 8, 10);

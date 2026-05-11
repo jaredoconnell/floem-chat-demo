@@ -8,10 +8,13 @@ use crate::theme;
 ///
 /// Receives derived closures for the server name and filtered channel list so
 /// it has no knowledge of servers or the global channel store.
+/// ``on_select`` is called after a channel is activated (e.g. to focus
+/// the chat input).
 pub fn channel_sidebar_panel(
     server_name: impl Fn() -> String + 'static,
     filtered_channels: impl Fn() -> Vec<Channel> + 'static + Copy,
     active_channel: RwSignal<usize>,
+    on_select: impl Fn(usize) + 'static + Copy,
 ) -> impl IntoView {
     let channel_list = VirtualStack::full(
         move || VecData(filtered_channels()),
@@ -21,7 +24,10 @@ pub fn channel_sidebar_panel(
             channel_item(
                 ch.name,
                 move || active_channel.get() == cid,
-                move || active_channel.set(cid),
+                move || {
+                    active_channel.set(cid);
+                    on_select(cid);
+                },
             )
         },
     )

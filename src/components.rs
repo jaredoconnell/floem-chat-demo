@@ -101,6 +101,7 @@ pub fn header_bar(
                 .font_size(16.0)
                 .font_weight(floem::text::FontWeight::BOLD)
                 .color(theme::TEXT_PRIMARY)
+                .background(theme::PANE_HEADER_BG)
                 .border_bottom(1.0)
                 .border_color(theme::HEADER_BORDER)
         })
@@ -189,10 +190,13 @@ pub fn message_row(
 
 /// Self-contained text input that manages its own buffer. Calls `on_submit`
 /// with the typed text when Enter is pressed, then clears the buffer.
+///
+/// Returns the concrete ``TextInput`` so callers can inspect its ``ViewId``
+/// (e.g. to programmatically focus it).
 pub fn message_input(
     placeholder: &'static str,
     on_submit: impl Fn(String) + 'static + Copy,
-) -> impl IntoView {
+) -> TextInput {
     let buffer = RwSignal::new(String::new());
 
     TextInput::new(buffer)
@@ -269,7 +273,6 @@ pub fn pane_header(
                 .padding_left(12.0)
                 .padding_right(8.0)
                 .items_center()
-                .background(theme::PANE_HEADER_BG)
                 .border_bottom(1.0)
                 .border_color(theme::PANE_BORDER)
         })

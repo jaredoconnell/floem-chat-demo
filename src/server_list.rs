@@ -9,11 +9,14 @@ use crate::theme;
 /// Clicking a server sets `active_server` and resets `active_channel` to the
 /// first channel belonging to that server. The active server row gets a
 /// tab-shaped background that visually bridges into the channel sidebar.
+/// ``on_select`` is called after the active channel changes (e.g. to
+/// focus the chat input).
 pub fn server_list_panel(
     servers: RwSignal<Vec<Server>>,
     active_server: RwSignal<usize>,
     channels: RwSignal<Vec<Channel>>,
     active_channel: RwSignal<usize>,
+    on_select: impl Fn(usize) + 'static + Copy,
 ) -> impl IntoView {
     VirtualStack::full(
         move || VecData(servers.get()),
@@ -38,6 +41,7 @@ pub fn server_list_panel(
                         .map(|c| c.id);
                     if let Some(ch_id) = first {
                         active_channel.set(ch_id);
+                        on_select(ch_id);
                     }
                 },
             )
