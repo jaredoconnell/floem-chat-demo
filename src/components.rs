@@ -1,3 +1,31 @@
+//! Reusable Floem widget components.
+//!
+//! ## Floem concepts demonstrated in this module
+//!
+//! - **Reactive style closures** — `.style(move |s| ...)` is called by Floem
+//!   whenever a signal read inside it changes. This is how views update their
+//!   appearance reactively without explicit "set state → re-render" calls.
+//!
+//! - **Hover styles** — `.hover(|s| ...)` applies additional styles when the
+//!   pointer is over the element. Floem handles the hover state tracking
+//!   automatically; you just describe the delta.
+//!
+//! - **CSS transitions** — `.transition(Property, Transition::ease_in_out(duration))`
+//!   animates property changes smoothly. Here `Background` transitions are used
+//!   on the icon circle for a Discord-like morph effect.
+//!
+//! - **Events** — `.on_event_stop(listener, callback)` attaches an event handler
+//!   and stops propagation. `on_event_cont` does the same but lets the event
+//!   continue propagating to parent views. The `listener::Click` and
+//!   `listener::PointerDown` constants identify which event to listen for.
+//!
+//! - **`into_any()`** — erases the concrete view type to `AnyView`, needed when
+//!   `if/else` branches return different view types. Floem views are statically
+//!   typed, so both branches must return the same type.
+//!
+//! - **`Empty::new()`** — a zero-size invisible view used as a spacer or
+//!   placeholder when conditional content should take up no space.
+
 use floem::prelude::*;
 use floem::style::{Background, CursorStyle, Transition};
 use floem::unit::DurationUnitExt;
@@ -12,6 +40,19 @@ use crate::theme;
 
 /// Renders a square container with a centered letter, transitioning its
 /// `border_radius` between fully round and slightly rounded on hover.
+///
+/// ## How the Discord-style morph works
+///
+/// - Default state: `border_radius = half` → perfect circle
+/// - Active/hovered state: `border_radius = 0.3 * size` → rounded square
+/// - The `transition(Background, ...)` animates the background color
+///   change over 150ms with ease-in-out easing.
+///
+/// ## Callback pattern
+///
+/// `is_active` and `on_click` are `impl Fn() + Copy` — they're closures
+/// that capture `RwSignal`s (which are `Copy`). This pattern lets the
+/// component be reactive without knowing what signals drive it.
 pub fn icon_circle(
     letter: char,
     bg_color: Color,
@@ -24,6 +65,8 @@ pub fn icon_circle(
 
     Label::new(letter.to_string())
         .style(move |s| {
+            // This closure is reactive: `is_active()` reads a signal,
+            // so Floem re-evaluates the style whenever that signal changes.
             s.width(size)
                 .min_width(size)
                 .height(size)
@@ -33,14 +76,20 @@ pub fn icon_circle(
                 .font_size(size * 0.45)
                 .color(theme::TEXT_PRIMARY)
                 .background(bg_color)
+                // Reactively switch radius: circle when inactive, rounded square when active.
                 .border_radius(if is_active() { active_radius } else { half })
+                // Animate background changes (e.g. when switching between
+                // active/inactive). `Background` is a style property identifier.
                 .transition(
                     Background,
                     Transition::ease_in_out(150.millis()),
                 )
                 .cursor(CursorStyle::Pointer)
+                // Hover pseudo-state: always show rounded-square on hover.
                 .hover(move |s| s.border_radius(active_radius))
         })
+        // `on_event_stop` stops event propagation so parent views don't also
+        // handle this click. The callback signature is (view, event_data).
         .on_event_stop(listener::Click, move |_, _| on_click())
 }
 
@@ -48,6 +97,10 @@ pub fn icon_circle(
 // Channel item — a `# channel-name` row
 // ---------------------------------------------------------------------------
 
+/// A clickable channel row, showing "# channel-name" with active/hover states.
+///
+/// The `is_active` closure is read inside the style closure, making the
+/// appearance update reactively when the active channel changes.
 pub fn channel_item(
     name: String,
     is_active: impl Fn() -> bool + 'static + Copy,
@@ -74,6 +127,8 @@ pub fn channel_item(
                 })
                 .cursor(CursorStyle::Pointer)
                 .hover(move |s| {
+                    // Only show hover effect on inactive items — active items
+                    // already have a highlight background.
                     if !active {
                         s.background(theme::HOVER_BG).color(theme::TEXT_PRIMARY)
                     } else {
@@ -88,10 +143,21 @@ pub fn channel_item(
 // Header bar — reused at the top of both the channel sidebar and chat area
 // ---------------------------------------------------------------------------
 
+/// A bold title bar used as a section header.
+///
+/// ## `Label::derived` vs `Label::new`
+///
+/// - `Label::new(string)` creates a static label — the text never changes.
+/// - `Label::derived(closure)` creates a reactive label — Floem re-calls the
+///   closure whenever a signal read inside it changes, updating the displayed
+///   text automatically. Here, the server/channel name updates when the user
+///   switches servers or channels.
 pub fn header_bar(
     title: impl Fn() -> String + 'static,
     prefix: &'static str,
 ) -> impl IntoView {
+    // `Label::derived` takes a closure that returns the text to display.
+    // It re-evaluates whenever signals inside `title()` change.
     Label::derived(move || format!("{prefix}{}", title()))
         .style(|s| {
             s.width_full()
@@ -114,12 +180,29 @@ pub fn header_bar(
 /// Fixed heights so VirtualStack's `item_size_fn` can provide exact values,
 /// avoiding the default `Assume(None)` estimation (which starts at 10px and
 /// only measures a single item, breaking variable-height layouts).
+///
+/// These must match the heights set via `.height()` in `message_row`'s style.
+/// VirtualStack uses these to calculate scroll positions and viewport bounds
+/// without laying out every item.
 pub const MSG_HEIGHT_HEADER: f64 = 54.0;
 pub const MSG_HEIGHT_CONTINUATION: f64 = 22.0;
 
 /// Renders one message. When `show_header` is true, the avatar, author name,
 /// and timestamp are displayed (first message in a cozy group). Otherwise only
 /// the content is shown, indented to align with grouped messages.
+///
+/// ## `into_any()` for conditional views
+///
+/// The `if show_header { ... } else { ... }` branches return different view
+/// types (e.g. `user_avatar(...)` vs `Empty::new()`). Floem views are
+/// statically typed, so we call `.into_any()` on each branch to erase the
+/// concrete type to `AnyView`, allowing both branches to have the same type.
+///
+/// ## `.clip()` for fixed-height rows
+///
+/// Long messages may wrap to more lines than fit in the fixed row height.
+/// `.clip()` prevents overflow text from bleeding into adjacent rows.
+/// This is important for VirtualStack, which positions rows at exact offsets.
 pub fn message_row(
     author: String,
     content: String,
@@ -137,7 +220,7 @@ pub fn message_row(
             .style(|s| s.margin_top(2.0))
             .into_any()
     } else {
-        // Invisible spacer keeping the indent consistent
+        // Invisible spacer keeping the indent consistent with header rows.
         Empty::new()
             .style(|s| s.width(32.0).min_width(32.0).height(0.0))
             .into_any()
@@ -165,6 +248,8 @@ pub fn message_row(
 
     // min_width(0) lets the text column shrink below its content width
     // in the flex row, preventing long messages from expanding the pane.
+    // Without this, a long message would force the entire row to be as
+    // wide as the longest line, breaking the fixed-width layout.
     let text_col = Stack::vertical((header_row, content_label))
         .style(|s| s.min_width(0.0).flex_grow(1.0));
 
@@ -172,10 +257,10 @@ pub fn message_row(
         .style(move |s| {
             s.width_full()
                 .height(row_height)
-                .col_gap(12.0)
+                .col_gap(12.0) // gap between avatar and text columns
                 .padding_left(16.0)
                 .padding_right(16.0)
-                .items_start()
+                .items_start() // align avatar to top, not center
                 .padding_top(4.0)
         })
         // Clip wrapped text that exceeds the fixed row height so it
@@ -192,7 +277,20 @@ pub fn message_row(
 /// with the typed text when Enter is pressed, then clears the buffer.
 ///
 /// Returns the concrete ``TextInput`` so callers can inspect its ``ViewId``
-/// (e.g. to programmatically focus it).
+/// (e.g. to programmatically focus it via `view_id.request_focus()`).
+///
+/// ## `TextInput` and `RwSignal<String>`
+///
+/// Floem's `TextInput` is bound to an `RwSignal<String>` — the signal
+/// *is* the source of truth for the text content. The widget reads from
+/// and writes to this signal as the user types. To clear the input after
+/// submit, we simply `buffer.set(String::new())`.
+///
+/// ## `TextInputEnter::listener()`
+///
+/// This is a custom event type specific to `TextInput`. It fires when
+/// the user presses Enter inside the text field. We use `on_event_stop`
+/// so the Enter keypress doesn't propagate further.
 pub fn message_input(
     placeholder: &'static str,
     on_submit: impl Fn(String) + 'static + Copy,
@@ -225,14 +323,15 @@ pub fn message_input(
 // ---------------------------------------------------------------------------
 
 /// A small colored circle with a centered letter, used to indicate
-/// which server a chat pane belongs to.
+/// which server a chat pane belongs to in the paned mode headers.
+/// Similar to `icon_circle` but smaller and non-interactive.
 pub fn mini_server_icon(letter: char, color: Color) -> impl IntoView {
     Label::new(letter.to_string()).style(move |s| {
         s.width(18.0)
             .min_width(18.0)
             .height(18.0)
             .min_height(18.0)
-            .border_radius(9.0)
+            .border_radius(9.0) // half of 18 = circle
             .background(color)
             .color(Color::WHITE)
             .justify_center()
@@ -248,10 +347,19 @@ pub fn mini_server_icon(letter: char, color: Color) -> impl IntoView {
 
 /// Header bar for an individual pane. The caller provides the left-side
 /// content (e.g. a label, an icon + label, etc.) and a close callback.
+///
+/// ## Composability with `impl IntoView`
+///
+/// The `left_content` parameter accepts anything that implements `IntoView`,
+/// so callers can pass a simple `Label`, a `Stack` of icons and labels,
+/// or any other view composition. This is Floem's core composition pattern.
 pub fn pane_header(
     left_content: impl IntoView + 'static,
     on_close: impl Fn() + 'static + Copy,
 ) -> impl IntoView {
+    // Wrap left_content in a horizontal stack with flex_grow so it fills
+    // available space. min_width(0) allows text to truncate rather than
+    // pushing the close button off-screen.
     let left = Stack::horizontal((left_content,))
         .style(|s| s.flex_grow(1.0).items_center().min_width(0.0));
 
