@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use floem::action::{exec_after_animation_frame, set_cursor_hittest};
+use floem::action::{exec_after_animation_frame, set_input_regions, set_window_level};
 use floem::prelude::*;
 use floem::style::CursorStyle;
 use floem::views::{ClipExt, Decorators, Empty, dyn_stack};
-use floem::window::WindowConfig;
+use floem::window::{WindowConfig, WindowLevel};
 
 use floem_demo::chat_area::chat_area_contents;
 use floem_demo::components::{channel_item, icon_circle, mini_server_icon, pane_header};
@@ -556,12 +556,14 @@ fn start_animation(
     dragging: RwSignal<Option<DragInfo>>,
     animating: RwSignal<bool>,
     anim_tick: RwSignal<u64>,
+    window_size: RwSignal<(f64, f64)>,
+    pseudo_window: RwSignal<bool>,
 ) {
     if animating.get_untracked() {
         return;
     }
     animating.set(true);
-    schedule_frame(panes, dragging, animating, anim_tick);
+    schedule_frame(panes, dragging, animating, anim_tick, window_size, pseudo_window);
 }
 
 fn schedule_frame(
@@ -569,6 +571,8 @@ fn schedule_frame(
     dragging: RwSignal<Option<DragInfo>>,
     animating: RwSignal<bool>,
     anim_tick: RwSignal<u64>,
+    window_size: RwSignal<(f64, f64)>,
+    pseudo_window: RwSignal<bool>,
 ) {
     exec_after_animation_frame(move |_| {
         let drag_id = dragging.get_untracked().map(|d| d.pane_id);
@@ -576,12 +580,41 @@ fn schedule_frame(
         // Bump the tick counter so style closures re-evaluate without
         // dyn_stack re-diffing the whole pane list.
         anim_tick.set(anim_tick.get_untracked() + 1);
+        // Push updated input regions only in pseudo-window mode (transparent click-through).
+        if pseudo_window.get_untracked() {
+            let (ww, wh) = window_size.get_untracked();
+            panes.with_untracked(|p| update_input_regions(p, ww, wh));
+        }
         if needs_more {
-            schedule_frame(panes, dragging, animating, anim_tick);
+            schedule_frame(panes, dragging, animating, anim_tick, window_size, pseudo_window);
         } else {
             animating.set(false);
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Input region computation for transparent click-through
+// ---------------------------------------------------------------------------
+
+/// Compute the set of rectangles (in window-local logical coords) that
+/// should receive mouse input, and push them to Floem.  Called whenever
+/// pane geometry or window size changes.
+fn update_input_regions(panes: &[PaneState], window_width: f64, window_height: f64) {
+    use floem::kurbo::Rect;
+    let mut regions = Vec::with_capacity(panes.len() + 1);
+    // Toolbar strip across the top.
+    regions.push(Rect::new(0.0, 0.0, window_width, TOOLBAR_HEIGHT));
+    for ps in panes {
+        let dh = if ps.collapsed {
+            PANE_HEADER_HEIGHT
+        } else {
+            ps.height
+        };
+        let top = if ps.docked { window_height - dh } else { ps.y };
+        regions.push(Rect::new(ps.x, top, ps.x + ps.width, top + dh));
+    }
+    set_input_regions(Some(regions));
 }
 
 // ---------------------------------------------------------------------------
@@ -687,6 +720,7 @@ fn toolbar(
     focus_pane_id: RwSignal<Option<usize>>,
     anim_tick: RwSignal<u64>,
     pane_version: RwSignal<u64>,
+    pseudo_window: RwSignal<bool>,
 ) -> impl IntoView {
     // Show the button when the browser pane is closed OR stacked.
     let browser_visible = move || {
@@ -728,7 +762,7 @@ fn toolbar(
                 focus_pane_id.set(Some(eid));
                 let (ww, _) = window_size.get_untracked();
                 panes.update(|p| recompute_dock_targets(p, ww, Some(eid)));
-                start_animation(panes, dragging, animating, anim_tick);
+                start_animation(panes, dragging, animating, anim_tick, window_size, pseudo_window);
                 return;
             }
             let pid = next_pane_id.get_untracked();
@@ -753,7 +787,7 @@ fn toolbar(
                 recompute_dock_targets(p, ww, Some(pid));
             });
             pane_version.set(pane_version.get_untracked() + 1);
-            start_animation(panes, dragging, animating, anim_tick);
+            start_animation(panes, dragging, animating, anim_tick, window_size, pseudo_window);
         });
 
     let drag_grip = Label::new("⠿")
@@ -781,10 +815,62 @@ fn toolbar(
             floem::quit_app();
         });
 
-    // Spacer pushes the close button to the right edge.
+    let pinned = RwSignal::new(false);
+    let pin_btn = Label::derived(move || if pinned.get() { "📌" } else { "📌" })
+        .style(move |s| {
+            let active = pinned.get();
+            s.font_size(16.0)
+                .padding(6.0)
+                .border_radius(4.0)
+                .cursor(CursorStyle::Pointer)
+                .color(if active { theme::TEXT_PRIMARY } else { theme::TEXT_MUTED })
+                .background(if active { theme::ACTIVE_BG } else { Color::TRANSPARENT })
+                .hover(|s| s.background(theme::HOVER_BG))
+        })
+        .on_event_stop(listener::Click, move |_, _| {
+            let new_val = !pinned.get_untracked();
+            pinned.set(new_val);
+            let level = if new_val {
+                WindowLevel::AlwaysOnTop
+            } else {
+                WindowLevel::Normal
+            };
+            set_window_level(level);
+        });
+
+    // Pseudo-window mode: transparent background with per-region click-through.
+    // When off, the window is opaque and captures all input.
+    let pseudo_window_btn = Label::derived(move || {
+            if pseudo_window.get() { "PW" } else { "pw" }
+        })
+        .style(move |s| {
+            let active = pseudo_window.get();
+            s.font_size(14.0)
+                .font_weight(floem::text::FontWeight::BOLD)
+                .padding(6.0)
+                .border_radius(4.0)
+                .cursor(CursorStyle::Pointer)
+                .color(if active { theme::TEXT_PRIMARY } else { theme::TEXT_MUTED })
+                .background(if active { theme::ACTIVE_BG } else { Color::TRANSPARENT })
+                .hover(|s| s.background(theme::HOVER_BG))
+        })
+        .on_event_stop(listener::Click, move |_, _| {
+            let new_val = !pseudo_window.get_untracked();
+            pseudo_window.set(new_val);
+            if new_val {
+                // Re-enable input regions for click-through
+                let (ww, wh) = window_size.get_untracked();
+                panes.with_untracked(|p| update_input_regions(p, ww, wh));
+            } else {
+                // Disable input regions — whole window receives clicks
+                set_input_regions(None);
+            }
+        });
+
+    // Spacer pushes the right-side buttons to the right edge.
     let spacer = Empty::new().style(|s| s.flex_grow(1.0));
 
-    Stack::horizontal((drag_grip, show_servers_btn, spacer, close_app_btn))
+    Stack::horizontal((drag_grip, show_servers_btn, spacer, pseudo_window_btn, pin_btn, close_app_btn))
         .style(|s| {
             s.width_full()
                 .height(TOOLBAR_HEIGHT)
@@ -824,6 +910,7 @@ fn pane_card(
     anim_tick: RwSignal<u64>,
     pane_version: RwSignal<u64>,
     focus_triggers: RwSignal<HashMap<usize, RwSignal<u64>>>,
+    pseudo_window: RwSignal<bool>,
 ) -> impl IntoView {
     let channel_id_opt = kind.channel_id();
 
@@ -842,7 +929,7 @@ fn pane_card(
             recompute_dock_targets(p, ww, fid);
         });
         pane_version.set(pane_version.get_untracked() + 1);
-        start_animation(panes, dragging, animating, anim_tick);
+        start_animation(panes, dragging, animating, anim_tick, window_size, pseudo_window);
     };
 
     let start_drag = move || {
@@ -972,14 +1059,19 @@ fn pane_card(
                 .find(|p| p.kind.channel_id() == Some(channel_id))
                 .map(|p| p.id);
             if let Some(eid) = existing_id {
-                // Bring the existing pane into view and focus its text input.
+                // Bring the existing pane into view, un-collapse it, and focus its text input.
                 focus_pane_id.set(Some(eid));
                 let (ww, _) = window_size.get_untracked();
-                panes.update(|p| recompute_dock_targets(p, ww, Some(eid)));
+                panes.update(|p| {
+                    if let Some(pane) = p.iter_mut().find(|ps| ps.id == eid) {
+                        pane.collapsed = false;
+                    }
+                    recompute_dock_targets(p, ww, Some(eid));
+                });
                 if let Some(trigger) = focus_triggers.with_untracked(|m| m.get(&channel_id).copied()) {
                     trigger.update(|v| *v += 1);
                 }
-                start_animation(panes, dragging, animating, anim_tick);
+                start_animation(panes, dragging, animating, anim_tick, window_size, pseudo_window);
                 return;
             }
             let pid = next_pane_id.get_untracked();
@@ -1024,7 +1116,7 @@ fn pane_card(
                 recompute_dock_targets(p, ww, Some(pid));
             });
             pane_version.set(pane_version.get_untracked() + 1);
-            start_animation(panes, dragging, animating, anim_tick);
+            start_animation(panes, dragging, animating, anim_tick, window_size, pseudo_window);
         };
         browser_content(servers, channels, active_server, panes, on_open_channel).into_any()
     };
@@ -1335,14 +1427,15 @@ fn app_view() -> impl IntoView {
     // from infrequent structural changes (add/remove pane).
     let anim_tick: RwSignal<u64> = RwSignal::new(0);
     let pane_version: RwSignal<u64> = RwSignal::new(0);
-    // Tracks whether cursor hittest is currently disabled for click-through.
-    let hittest_disabled: RwSignal<bool> = RwSignal::new(false);
     // Maps channel_id → focus trigger signal so channel clicks can focus the right input.
     let focus_triggers: RwSignal<HashMap<usize, RwSignal<u64>>> = RwSignal::new(HashMap::new());
+    // Pseudo-window mode: when true, the window is transparent with
+    // per-region click-through. When false, opaque and captures all input.
+    let pseudo_window: RwSignal<bool> = RwSignal::new(false);
 
     let toolbar = toolbar(
         panes, next_pane_id, window_size, dragging, animating, focus_pane_id,
-        anim_tick, pane_version,
+        anim_tick, pane_version, pseudo_window,
     );
 
     let pane_area = dyn_stack(
@@ -1372,13 +1465,27 @@ fn app_view() -> impl IntoView {
                 anim_tick,
                 pane_version,
                 focus_triggers,
+                pseudo_window,
             )
         },
     )
     .style(|s| s.width_full().height_full());
 
+    // Push initial input regions only if starting in pseudo-window mode.
+    if pseudo_window.get_untracked() {
+        let (ww, wh) = (initial_width, WINDOW_HEIGHT);
+        panes.with_untracked(|p| update_input_regions(p, ww, wh));
+    }
+
     Stack::new((pane_area, toolbar))
-        .style(|s| s.width_full().height_full())
+        .style(move |s| {
+            let bg = if pseudo_window.get() {
+                Color::TRANSPARENT
+            } else {
+                theme::CHAT_BG
+            };
+            s.width_full().height_full().background(bg)
+        })
         .on_event_cont(
             listener::WindowResized,
             move |_, size: &floem::kurbo::Size| {
@@ -1387,7 +1494,13 @@ fn app_view() -> impl IntoView {
                 if (old.0 - size.width).abs() > 1.0 {
                     let fid = focus_pane_id.get_untracked();
                     panes.update(|p| recompute_dock_targets(p, size.width, fid));
-                    start_animation(panes, dragging, animating, anim_tick);
+                    start_animation(panes, dragging, animating, anim_tick, window_size, pseudo_window);
+                }
+                // Refresh input regions on resize only in pseudo-window mode.
+                if pseudo_window.get_untracked() {
+                    panes.with_untracked(|p| {
+                        update_input_regions(p, size.width, size.height);
+                    });
                 }
             },
         )
@@ -1444,7 +1557,7 @@ fn app_view() -> impl IntoView {
                         }
                     });
                     anim_tick.set(anim_tick.get_untracked() + 1);
-                    start_animation(panes, dragging, animating, anim_tick);
+                    start_animation(panes, dragging, animating, anim_tick, window_size, pseudo_window);
                 }
                 rz.last_x = Some(pos.x);
                 rz.last_y = Some(pos.y);
@@ -1523,7 +1636,7 @@ fn app_view() -> impl IntoView {
                         }
                     });
                     anim_tick.set(anim_tick.get_untracked() + 1);
-                    start_animation(panes, dragging, animating, anim_tick);
+                    start_animation(panes, dragging, animating, anim_tick, window_size, pseudo_window);
                 }
                 drag.last_pointer_x = Some(pos.x);
                 drag.last_pointer_y = Some(pos.y);
@@ -1531,41 +1644,9 @@ fn app_view() -> impl IntoView {
                 return;
             }
 
-            // --- Click-through on transparent areas ---
-            // Only toggle hittest when the state actually changes to avoid
-            // redundant OS calls every PointerMove.
-            let (_, wh) = window_size.get_untracked();
-            let over_toolbar = pos.y <= TOOLBAR_HEIGHT;
-            let over_pane = panes.with_untracked(|p| {
-                p.iter().any(|ps| {
-                    let dh = if ps.collapsed { PANE_HEADER_HEIGHT } else { ps.height };
-                    let top = if ps.docked { wh - dh } else { ps.y };
-                    pos.x >= ps.x
-                        && pos.x <= ps.x + ps.width
-                        && pos.y >= top
-                        && pos.y <= top + dh
-                })
-            });
-            let over_ui = over_toolbar || over_pane;
-            if over_ui && hittest_disabled.get_untracked() {
-                set_cursor_hittest(true);
-                hittest_disabled.set(false);
-            } else if !over_ui && !hittest_disabled.get_untracked() {
-                set_cursor_hittest(false);
-                hittest_disabled.set(true);
-                // Once hittest is disabled, the OS stops delivering pointer
-                // events to this window. Schedule a short re-enable so the
-                // next pointer movement can be re-evaluated.
-                floem::action::exec_after(
-                    std::time::Duration::from_millis(16),
-                    move |_| {
-                        if hittest_disabled.get_untracked() {
-                            set_cursor_hittest(true);
-                            hittest_disabled.set(false);
-                        }
-                    },
-                );
-            }
+            // Input regions are pushed to Floem from the reactive
+            // update_input_regions helper (called on anim_tick / pane_version
+            // changes), so no per-move logic is needed here.
         })
         // Pointer up: finalize resize, drag, or toggle collapsed
         .on_event_cont(listener::PointerUp, move |_, _| {
@@ -1575,7 +1656,7 @@ fn app_view() -> impl IntoView {
                 let fid = focus_pane_id.get_untracked();
                 panes.update(|p| recompute_dock_targets(p, ww, fid));
                 resizing.set(None);
-                start_animation(panes, dragging, animating, anim_tick);
+                start_animation(panes, dragging, animating, anim_tick, window_size, pseudo_window);
                 return;
             }
 
@@ -1639,7 +1720,7 @@ fn app_view() -> impl IntoView {
                     }
                 }
                 dragging.set(None);
-                start_animation(panes, dragging, animating, anim_tick);
+                start_animation(panes, dragging, animating, anim_tick, window_size, pseudo_window);
             }
         })
         .window_title(|| "Paned Demo".to_string())
@@ -1668,7 +1749,7 @@ fn app_view() -> impl IntoView {
                         recompute_dock_targets(p, ww, new_focus);
                     });
                     pane_version.set(pane_version.get_untracked() + 1);
-                    start_animation(panes, dragging, animating, anim_tick);
+                    start_animation(panes, dragging, animating, anim_tick, window_size, pseudo_window);
                 }
             }
         })
