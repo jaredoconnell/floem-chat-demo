@@ -157,6 +157,15 @@ pub struct PaneState {
     /// - 200: fully visible panes
     /// - 300: currently being dragged (always on top)
     pub z_order: i32,
+    /// Pixels of width collapsed away during the stacking animation.
+    /// 0.0 = fully expanded, ``(width - PEEK_WIDTH)`` = fully collapsed.
+    /// Animated by ``tick_animation`` toward a target derived from ``stack_side``.
+    pub collapse_width: f64,
+    /// Remembers which side the collapse animation is for.
+    /// Set when stacking begins (copied from ``stack_side``), persists through
+    /// the unstacking expansion so ``render_x``/``render_width`` know which
+    /// direction to animate, then cleared when ``collapse_width`` reaches 0.
+    pub collapse_side: Option<StackSide>,
 }
 
 /// `PaneState` identity is based solely on `id` — two panes with the same
@@ -203,23 +212,36 @@ impl PaneState {
         }
     }
 
-    /// Rendered width: narrow peek strip when stacked, full width otherwise.
+    /// Rendered width, smoothly interpolated during collapse/expand animation.
+    /// During animation ``collapse_width`` moves from 0 toward
+    /// ``(width - PEEK_WIDTH)``; the rendered width is the difference.
     pub fn render_width(&self) -> f64 {
-        if self.stack_side.is_some() {
-            PEEK_WIDTH
+        if self.collapse_side.is_some() {
+            self.width - self.collapse_width
         } else {
             self.width
         }
     }
 
-    /// Rendered x position, accounting for right-stacked alignment.
-    /// Right-stacked panes show their right edge (the peek strip),
-    /// so the rendered origin shifts rightward by ``width - PEEK_WIDTH``.
+    /// Rendered x position, smoothly interpolated during collapse/expand.
+    /// For right-stacked panes the left edge moves rightward by
+    /// ``collapse_width`` so the visible strip stays anchored to the right.
     pub fn render_x(&self) -> f64 {
-        match self.stack_side {
-            Some(StackSide::Right) => self.x + self.width - PEEK_WIDTH,
+        match self.collapse_side {
+            Some(StackSide::Right) => self.x + self.collapse_width,
             _ => self.x,
         }
+    }
+
+    /// True when the collapse animation has fully completed (pane is a peek tab).
+    pub fn is_fully_collapsed(&self) -> bool {
+        self.collapse_side.is_some()
+            && (self.width - PEEK_WIDTH - self.collapse_width).abs() < ANIM_SNAP
+    }
+
+    /// True when a collapse or expand animation is in progress.
+    pub fn is_collapse_animating(&self) -> bool {
+        self.collapse_side.is_some() && self.collapse_width > 0.0
     }
 
     /// Minimum width allowed during resize (collapsed panes can go narrower).
@@ -230,6 +252,33 @@ impl PaneState {
             MIN_PANE_WIDTH
         }
     }
+}
+
+/// Find the best pane to focus after closing the pane with `closing_id`.
+///
+/// Prefers the left neighbor (next higher ``dock_order``), falling back to
+/// the right neighbor (next lower ``dock_order``). Returns ``None`` if no
+/// other panes remain.
+pub fn neighbor_focus(panes: &[PaneState], closing_id: usize) -> Option<usize> {
+    let closing_order = panes.iter().find(|p| p.id == closing_id)?.dock_order;
+    // Exclude the browser pane — it's pinned to the right edge and shouldn't
+    // receive focus when closing chat panes.
+    let others = panes
+        .iter()
+        .filter(|p| p.id != closing_id && !matches!(p.kind, PaneKind::Browser));
+
+    // Left neighbor: smallest dock_order greater than the closing pane's.
+    let left = others
+        .clone()
+        .filter(|p| p.dock_order > closing_order)
+        .min_by_key(|p| p.dock_order);
+
+    // Right neighbor: largest dock_order less than the closing pane's.
+    let right = others
+        .filter(|p| p.dock_order < closing_order)
+        .max_by_key(|p| p.dock_order);
+
+    left.or(right).map(|p| p.id)
 }
 
 // ---------------------------------------------------------------------------

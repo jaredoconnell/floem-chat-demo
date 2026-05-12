@@ -1,11 +1,14 @@
 //! Floem Demo — a Discord-like chat UI demonstrating Floem's reactive toolkit.
 //!
-//! This library crate is shared by two binary entry points:
+//! This library crate is shared by three binary entry points:
 //!
 //! - **`bin/unified.rs`**: Classic three-column layout (server bar, channel
 //!   sidebar, chat area) in a single decorated window.
 //! - **`bin/paned.rs`**: Advanced floating-pane window manager with drag,
-//!   resize, card-stack overflow, and transparent click-through.
+//!   resize, card-stack overflow, and transparent click-through — all inside
+//!   a single undecorated window (works on Wayland).
+//! - **`bin/native_paned.rs`**: Same pane behavior as `paned.rs` but using
+//!   real OS windows per pane (requires window positioning — macOS/X11/Windows).
 //!
 //! ## Module overview
 //!

@@ -133,7 +133,7 @@ fn app_view() -> impl IntoView {
     ))
     .style(|s| s.width_full().height_full())
     // `.window_title` sets the OS window title bar text.
-    .window_title(|| "Discord Demo".to_string())
+    .window_title(|| "Floem Chat UI Demo".to_string())
 }
 
 fn main() {

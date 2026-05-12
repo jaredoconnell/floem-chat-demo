@@ -71,10 +71,19 @@ pub fn icon_circle(
     on_click: impl Fn() + 'static + Copy,
 ) -> impl IntoView {
     let half = size / 2.0;
-    let active_radius = size * 0.3; // slightly rounded square when active/hovered
+    let active_radius = size * 0.12; // subtly rounded square when active/hovered
+
+    // Dimmed variants for inactive/hover states.
+    // Floem's `opacity` style isn't wired into the vello renderer, so we
+    // apply alpha directly to the background and text colors instead.
+    let dim_bg = bg_color.with_alpha(0.55);
+    let dim_text = theme::TEXT_PRIMARY.with_alpha(0.55);
+    let hover_bg = bg_color.with_alpha(0.8);
+    let hover_text = theme::TEXT_PRIMARY.with_alpha(0.8);
 
     Label::new(letter.to_string())
         .style(move |s| {
+            let active = is_active();
             // This closure is reactive: `is_active()` reads a signal,
             // so Floem re-evaluates the style whenever that signal changes.
             s.width(size)
@@ -84,19 +93,28 @@ pub fn icon_circle(
                 .justify_center()
                 .items_center()
                 .font_size(size * 0.45)
-                .color(theme::TEXT_PRIMARY)
-                .background(bg_color)
+                .color(if active { theme::TEXT_PRIMARY } else { dim_text })
+                .background(if active { bg_color } else { dim_bg })
                 // Reactively switch radius: circle when inactive, rounded square when active.
-                .border_radius(if is_active() { active_radius } else { half })
-                // Animate background changes (e.g. when switching between
-                // active/inactive). `Background` is a style property identifier.
+                .border_radius(if active { active_radius } else { half })
+                .scale(if active { 100.0 } else { 90.0 })
+                // Animate background changes smoothly.
                 .transition(
                     Background,
                     Transition::ease_in_out(150.millis()),
                 )
                 .cursor(CursorStyle::Pointer)
-                // Hover pseudo-state: always show rounded-square on hover.
-                .hover(move |s| s.border_radius(active_radius))
+                // Hover only affects inactive icons — active stays at full brightness.
+                .hover(move |s| {
+                    if is_active() {
+                        s
+                    } else {
+                        s.border_radius(active_radius)
+                            .scale(100.0)
+                            .background(hover_bg)
+                            .color(hover_text)
+                    }
+                })
         })
         // `on_event_stop` stops event propagation so parent views don't also
         // handle this click. The callback signature is (view, event_data).

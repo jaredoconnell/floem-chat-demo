@@ -27,14 +27,16 @@
 //! (a cheap `u64` copy) to subscribe, then use `panes.with_untracked()`
 //! to borrow specific fields. This keeps per-frame overhead minimal.
 
-use floem::action::exec_after_animation_frame;
+use floem::action::{TimerToken, exec_after_animation_frame, exec_after_animation_frame_for};
 use floem::prelude::*;
 
 use super::PaneCtx;
 use super::layout::update_input_regions;
 use super::model::*;
+use super::native::reposition_all_windows;
 
-/// Advance each non-dragged pane's ``x`` toward its ``target_x``.
+/// Advance each non-dragged pane's ``x`` toward its ``target_x`` and
+/// ``collapse_width`` toward its stack-derived target.
 ///
 /// ## Animation math (ease-out)
 ///
@@ -44,6 +46,9 @@ use super::model::*;
 /// crawling when `step` gets tiny. `ANIM_SNAP` snaps to the target
 /// when close enough, preventing sub-pixel jitter.
 ///
+/// The same constants are used for both the x-slide and the collapse
+/// animation so that they progress at matched rates and stay in sync.
+///
 /// Returns true if any pane still needs more animation.
 pub fn tick_animation(panes: &mut [PaneState], drag_id: Option<usize>) -> bool {
     let mut needs_more = false;
@@ -52,21 +57,54 @@ pub fn tick_animation(panes: &mut [PaneState], drag_id: Option<usize>) -> bool {
         if Some(pane.id) == drag_id {
             continue;
         }
+
+        // --- x-position animation ---
         let diff = pane.target_x - pane.x;
         if diff.abs() < ANIM_SNAP {
-            // Close enough — snap exactly to avoid sub-pixel jitter.
             pane.x = pane.target_x;
         } else {
             let step = diff * ANIM_FACTOR;
-            // Enforce minimum speed so animation doesn't crawl
             let step = if step.abs() < MIN_ANIM_SPEED {
                 MIN_ANIM_SPEED.copysign(diff)
             } else {
                 step
             };
-            // Clamp so the step never overshoots the target
             let step = if step.abs() > diff.abs() { diff } else { step };
             pane.x += step;
+            needs_more = true;
+        }
+
+        // --- collapse width animation ---
+        // Target is derived from stack_side: fully collapsed when stacked,
+        // fully expanded (0) when not.
+        let collapse_target = if pane.stack_side.is_some() {
+            pane.width - PEEK_WIDTH
+        } else {
+            0.0
+        };
+
+        // Record which side we're collapsing toward; persists through
+        // the expansion animation after stack_side is cleared by layout.
+        if pane.stack_side.is_some() {
+            pane.collapse_side = pane.stack_side;
+        }
+
+        let cdiff = collapse_target - pane.collapse_width;
+        if cdiff.abs() < ANIM_SNAP {
+            pane.collapse_width = collapse_target;
+            // Expansion complete — no longer animating in either direction.
+            if collapse_target == 0.0 {
+                pane.collapse_side = None;
+            }
+        } else {
+            let step = cdiff * ANIM_FACTOR;
+            let step = if step.abs() < MIN_ANIM_SPEED {
+                MIN_ANIM_SPEED.copysign(cdiff)
+            } else {
+                step
+            };
+            let step = if step.abs() > cdiff.abs() { cdiff } else { step };
+            pane.collapse_width += step;
             needs_more = true;
         }
     }
@@ -93,7 +131,7 @@ pub fn start_animation(ctx: PaneCtx) {
 /// 4. If any pane still needs animation, schedule another frame.
 ///    Otherwise, clear the `animating` flag.
 fn schedule_frame(ctx: PaneCtx) {
-    exec_after_animation_frame(move |_| {
+    let callback = move |_: TimerToken| {
         let drag_id = ctx.dragging.get_untracked().map(|d| d.pane_id);
         // `try_update` returns the closure's return value wrapped in Option.
         // It can fail if the signal has been disposed (shouldn't happen here).
@@ -112,10 +150,23 @@ fn schedule_frame(ctx: PaneCtx) {
             let (ww, wh) = ctx.window_size.get_untracked();
             ctx.panes.with_untracked(|p| update_input_regions(p, ww, wh));
         }
+        // In native multi-window mode, reposition all OS windows to
+        // match the updated layout positions each animation frame.
+        if ctx.is_native_mode() {
+            reposition_all_windows(ctx);
+        }
         if needs_more {
             schedule_frame(ctx);
         } else {
             ctx.animating.set(false);
         }
-    });
+    };
+
+    // In native mode, always schedule on the management window so the
+    // animation loop survives pane window destruction.
+    if let Some(anchor) = ctx.anchor_view.get_untracked() {
+        exec_after_animation_frame_for(anchor, callback);
+    } else {
+        exec_after_animation_frame(callback);
+    }
 }

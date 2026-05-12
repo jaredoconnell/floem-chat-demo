@@ -2,20 +2,12 @@
 //!
 //! ## Floem concepts demonstrated
 //!
-//! ### `.container()`
+//! ### `.container()` with conditional right border
 //!
 //! Wraps a view in a `Container` — a generic single-child wrapper that can
-//! have its own styles. Here we use it to create a "tab-shaped" background
-//! behind each server icon: when a server is active, the container's
-//! background matches the channel sidebar, creating a visual bridge between
-//! the server strip and the sidebar.
-//!
-//! ### Directional border radii
-//!
-//! Floem supports individual corner radii:
-//! `.border_top_left_radius(8.0)`, `.border_bottom_left_radius(8.0)`, etc.
-//! This creates the "tab" shape: rounded on the left, square on the right
-//! where it meets the sidebar.
+//! have its own styles. The active server's container gets a BLURPLE
+//! `border_right`, placing an accent bar between the icon and the channel
+//! sidebar. Inactive icons have no border and are dimmed via opacity.
 //!
 //! ### VirtualStack for small lists
 //!
@@ -31,10 +23,10 @@ use crate::theme;
 /// Vertical strip of server icons.
 ///
 /// Clicking a server sets `active_server` and resets `active_channel` to the
-/// first channel belonging to that server. The active server row gets a
-/// tab-shaped background that visually bridges into the channel sidebar.
-/// ``on_select`` is called after the active channel changes (e.g. to
-/// focus the chat input).
+/// first channel belonging to that server. The active server gets a BLURPLE
+/// accent bar on its right edge; inactive icons are dimmed.
+/// ``on_select`` is called after the active channel changes (e.g. to focus
+/// the chat input).
 pub fn server_list_panel(
     servers: RwSignal<Vec<Server>>,
     active_server: RwSignal<usize>,
@@ -73,35 +65,21 @@ pub fn server_list_panel(
                     }
                 },
             )
-            // `.container()` wraps the icon in a Container view so we can
-            // apply the tab-shaped background independently of the icon's
-            // own styles.
             .container()
             .style(move |s| {
                 let active = is_active();
                 s.justify_center()
                     .items_center()
-                    .padding_left(10.0)
-                    .padding_right(10.0)
-                    .padding_vert(4.0)
-                    // Tab shape: rounded left corners, square right corners.
-                    // The square right edge sits flush against the channel
-                    // sidebar, creating a seamless "tab" effect.
-                    .border_top_left_radius(8.0)
-                    .border_bottom_left_radius(8.0)
-                    .border_top_right_radius(0.0)
-                    .border_bottom_right_radius(0.0)
+                    .padding(8.0)
                     .margin_bottom(2.0)
-                    // Active server gets sidebar bg, creating visual continuity.
-                    .background(if active {
-                        theme::CHANNEL_SIDEBAR_BG
-                    } else {
-                        Color::TRANSPARENT
-                    })
+                    // Active server gets a BLURPLE bar on its right edge,
+                    // between the icon and the channel sidebar.
+                    .border_right(if active { 2.0 } else { 0.0 })
+                    .border_color(theme::BLURPLE)
             })
         },
     )
-    .style(|s| s.flex_col().items_end())
+    .style(|s| s.flex_col().items_center())
     .scroll()
     .style(|s| {
         // 48px header + 8px breathing room so icons start below the sidebar header.

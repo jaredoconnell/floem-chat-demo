@@ -16,5 +16,9 @@ path = "src/bin/unified.rs"
 name = "paned"
 path = "src/bin/paned.rs"
 
+[[bin]]
+name = "native_paned"
+path = "src/bin/native_paned.rs"
+
 [dependencies]
 floem = { path = "../floem", features = ["vello"] }

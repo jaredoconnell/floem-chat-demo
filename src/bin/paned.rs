@@ -91,6 +91,8 @@ fn app_view() -> impl IntoView {
             dock_order: 0,
             stack_side: None,
             z_order: 0,
+            collapse_width: 0.0,
+            collapse_side: None,
         }]),
         next_pane_id: RwSignal::new(1usize),
         dragging: RwSignal::new(None),
@@ -102,6 +104,12 @@ fn app_view() -> impl IntoView {
         pane_version: RwSignal::new(0),
         focus_triggers: RwSignal::new(HashMap::new()),
         pseudo_window: RwSignal::new(false),
+        // Unused in single-window mode — only populated by native_paned.
+        window_ids: RwSignal::new(HashMap::new()),
+        anchor_origin: RwSignal::new((0.0, 0.0)),
+        native_mode: RwSignal::new(false),
+        configured: RwSignal::new(true),
+        anchor_view: RwSignal::new(None),
     };
 
     let toolbar = toolbar(ctx);
@@ -433,38 +441,20 @@ fn app_view() -> impl IntoView {
         })
         // Set the OS window title (shown in taskbar/dock even for undecorated windows).
         .window_title(|| "Paned Demo".to_string())
-        // `keyboard_navigable()` makes the view focusable so it can receive
-        // KeyDown events. Without this, keyboard events would go to whatever
-        // child view has focus, and the root handler wouldn't fire.
+        // `keyboard_navigable()` allows the root view to receive
+        // KeyDown events that bubble up from child views.
         .style(|s| s.keyboard_navigable())
-        // --- Keyboard shortcut handler ---
-        // Cmd-W (Mac) / Ctrl-W (other) closes the focused pane.
+        // --- Cmd-W / Ctrl-W: close the focused pane ---
+        // The text editor now lets unhandled key combos bubble, so
+        // Cmd-W reaches here even when a text input has focus.
         .on_event_stop(listener::KeyDown, move |_, KeyboardEvent { key, modifiers, .. }| {
             #[cfg(target_os = "macos")]
             let close_mod = Modifiers::META;
             #[cfg(not(target_os = "macos"))]
             let close_mod = Modifiers::CONTROL;
 
-            if *key == Key::Character("w".into())
-                && modifiers.contains(close_mod)
-            {
-                if let Some(pid) = ctx.focus_pane_id.get_untracked() {
-                    let (ww, _) = ctx.window_size.get_untracked();
-                    // Pick the next pane to focus after closing.
-                    let new_focus = ctx.panes.with_untracked(|p| {
-                        p.iter()
-                            .filter(|ps| ps.id != pid)
-                            .max_by_key(|ps| ps.dock_order)
-                            .map(|ps| ps.id)
-                    });
-                    ctx.focus_pane_id.set(new_focus);
-                    ctx.panes.update(|p| {
-                        p.retain(|ps| ps.id != pid);
-                        recompute_dock_targets(p, ww, new_focus);
-                    });
-                    ctx.pane_version.set(ctx.pane_version.get_untracked() + 1);
-                    ctx.start_animation();
-                }
+            if *key == Key::Character("w".into()) && modifiers.contains(close_mod) {
+                ctx.close_focused_pane();
             }
         })
 }

@@ -49,7 +49,7 @@ use std::collections::HashMap;
 
 use floem::action::{set_input_regions, set_window_level};
 use floem::prelude::*;
-use floem::style::CursorStyle;
+use floem::style::{AnchorAbout, CursorStyle};
 use floem::views::{ClipExt, Decorators, Empty, dyn_stack};
 use floem::window::WindowLevel;
 
@@ -59,8 +59,11 @@ use crate::data::{Channel, Message, Server, send_message};
 use crate::theme;
 
 use super::PaneCtx;
-use super::layout::{recompute_dock_targets, update_input_regions};
+use super::layout::{
+    commit_drag_order, recompute_dock_targets, recompute_targets_during_drag, update_input_regions,
+};
 use super::model::*;
+use super::native::reposition_single_window;
 
 // ---------------------------------------------------------------------------
 // Pane label content — shared header/tab label builder
@@ -177,7 +180,7 @@ pub fn browser_content(
     panes: RwSignal<Vec<PaneState>>,
     on_open_channel: impl Fn(usize) + 'static + Copy,
 ) -> impl IntoView {
-    // Server icon column — same tab-shaped pattern as server_list.rs
+    // Server icon column — same selection ring as server_list.rs
     // but smaller (28px icons instead of 42px).
     let server_col = dyn_stack(
         // Data source: `servers.get()` subscribes this stack to the signal.
@@ -187,7 +190,6 @@ pub fn browser_content(
         move |server: Server| {
             let sid = server.id;
             let is_active = move || active_server.get() == sid;
-            // Tab-shaped row: active row bridges into the channel list.
             icon_circle(
                 server.icon_letter,
                 server.color(),
@@ -200,25 +202,14 @@ pub fn browser_content(
                 let active = is_active();
                 s.justify_center()
                     .items_center()
-                    .padding_left(6.0)
-                    .padding_right(6.0)
-                    .padding_vert(3.0)
-                    // Tab shape: rounded left, square right.
-                    .border_top_left_radius(6.0)
-                    .border_bottom_left_radius(6.0)
-                    .border_top_right_radius(0.0)
-                    .border_bottom_right_radius(0.0)
+                    .padding(6.0)
                     .margin_bottom(2.0)
-                    // Active server gets sidebar bg for visual continuity.
-                    .background(if active {
-                        theme::CHANNEL_SIDEBAR_BG
-                    } else {
-                        Color::TRANSPARENT
-                    })
+                    .border_right(if active { 1.5 } else { 0.0 })
+                    .border_color(theme::BLURPLE)
             })
         },
     )
-    .style(|s| s.flex_col().padding_top(4.0).items_end())
+    .style(|s| s.flex_col().padding_top(4.0).items_center())
     .scroll()
     .style(|s| {
         s.width(44.0)
@@ -355,6 +346,8 @@ pub fn toolbar(
                     dock_order: pid,
                     stack_side: None,
                     z_order: 0,
+                    collapse_width: 0.0,
+                    collapse_side: None,
                 });
                 // Recompute layout with the new pane as focus.
                 recompute_dock_targets(p, ww, Some(pid));
@@ -478,26 +471,16 @@ pub fn toolbar(
 // Pane card — unified container for both browser and chat panes
 // ---------------------------------------------------------------------------
 
-/// A complete pane card: header + content + resize handles + tab overlay.
+/// The inner content of a pane card: header + body + resize handles + tab
+/// overlay, clipped and styled with the pane's background and border.
 ///
-/// This is the main view factory called by `dyn_stack` in `paned.rs` for
-/// each open pane. It handles:
+/// This is the reusable core shared by both `pane_card` (single-window mode,
+/// adds absolute positioning) and the native multi-window mode (each pane is
+/// the root view of its own OS window — no positioning wrapper needed).
 ///
-/// - **Header**: drag handle + close button, with reactive focus highlight.
-/// - **Content**: either the browser pane or a chat timeline.
-/// - **Tab overlay**: rotated label shown when the pane is stacked.
-/// - **Resize handles**: invisible edge zones that initiate resize operations.
-/// - **Absolute positioning**: the entire card is positioned using
-///   `inset_left`/`inset_top` based on the pane's animated `x` position.
-///
-/// ## Signal subscription strategy
-///
-/// The outer style closure reads `anim_tick.get()` (a cheap u64) to
-/// subscribe to animation updates, then uses `panes.with_untracked()` to
-/// borrow the actual PaneState data without cloning. This is critical for
-/// performance — cloning `Vec<PaneState>` on every animation frame (60fps)
-/// would be wasteful.
-pub fn pane_card(
+/// Returns a clipped `Stack` with `width_full().height_full()` — the caller
+/// is responsible for sizing/positioning the container.
+pub fn pane_content(
     pane_id: usize,
     kind: PaneKind,
     servers: RwSignal<Vec<Server>>,
@@ -513,28 +496,34 @@ pub fn pane_card(
     // Removes the pane, cleans up its focus trigger, and re-layouts.
     let on_close = move || {
         let (ww, _) = ctx.window_size.get_untracked();
-        let mut fid = ctx.focus_pane_id.get_untracked();
-        // If the closed pane was the focus, clear it so recompute picks the newest.
-        if fid == Some(pane_id) {
-            fid = None;
-        }
+
+        // Pick a new focus before removing so focus_pane_id always
+        // points to a valid pane (or None if empty).
+        let new_focus = if ctx.focus_pane_id.get_untracked() == Some(pane_id) {
+            let nf = ctx.panes.with_untracked(|p| neighbor_focus(p, pane_id));
+            ctx.focus_pane_id.set(nf);
+            nf
+        } else {
+            ctx.focus_pane_id.get_untracked()
+        };
+
         // Clean up the focus trigger for this channel (if it's a chat pane).
         if let Some(cid) = channel_id_opt {
             ctx.focus_triggers.update(|m| { m.remove(&cid); });
         }
         ctx.panes.update(|p| {
             p.retain(|ps| ps.id != pane_id);
-            recompute_dock_targets(p, ww, fid);
+            recompute_dock_targets(p, ww, new_focus);
         });
-        // Bump pane_version so dyn_stack removes the view.
+        // Bump pane_version so dyn_stack / native sync removes the view/window.
         ctx.pane_version.set(ctx.pane_version.get_untracked() + 1);
         ctx.start_animation();
     };
 
     // --- Drag start handler ---
     // Called when the user presses on the header. Sets up DragInfo with
-    // initial state; actual drag movement is handled in paned.rs's
-    // PointerMove handler.
+    // initial state; actual drag movement is handled by the host binary's
+    // PointerMove handler (paned.rs or native_paned.rs).
     let start_drag = move || {
         let was_focused = ctx.focus_pane_id.get_untracked() == Some(pane_id);
         ctx.focus_pane_id.set(Some(pane_id));
@@ -678,6 +667,8 @@ pub fn pane_card(
                     dock_order: new_order,
                     stack_side: None,
                     z_order: 0,
+                    collapse_width: 0.0,
+                    collapse_side: None,
                 });
                 // Focus the new pane so the card-stack keeps it visible.
                 recompute_dock_targets(p, ww, Some(pid));
@@ -697,7 +688,10 @@ pub fn pane_card(
 
     // --- Clipped content area ---
     // The main pane content (header + body), clipped to the pane bounds.
-    // Hidden entirely when the pane is stacked (showing only the tab overlay).
+    // During the collapse animation the content stays at full pane width
+    // (avoiding text re-layout) and is clipped by the shrinking outer
+    // container. For right-stacking, a translate_x offset keeps the
+    // content visually stationary while the pane origin shifts rightward.
     let clipped_content = Stack::vertical((header, content))
         .style(|s| s.width_full().height_full())
         // Clicking anywhere in the pane focuses it.
@@ -711,70 +705,119 @@ pub fn pane_card(
         // `.clip()` prevents content from rendering outside the pane bounds.
         .clip()
         .style(move |s| {
-            // Subscribe to anim_tick so this style re-evaluates each frame.
             ctx.anim_tick.get();
-            // Check if this pane is stacked (compressed into a peek strip).
-            let is_stacked = ctx.panes.with_untracked(|ps| {
-                ps.iter()
-                    .find(|p| p.id == pane_id)
-                    .and_then(|p| p.stack_side)
-                    .is_some()
-            });
-            let base = s.width_full().height_full();
-            if is_stacked {
-                // Hide the full content when stacked — only the tab overlay shows.
-                base.display(floem::style::Display::None)
-            } else {
-                base
+            let (full_width, collapse_width, collapse_side, fully_collapsed, x, target_x) =
+                ctx.panes.with_untracked(|ps| {
+                    ps.iter()
+                        .find(|p| p.id == pane_id)
+                        .map(|p| (p.width, p.collapse_width, p.collapse_side,
+                                  p.is_fully_collapsed(), p.x, p.target_x))
+                        .unwrap_or((0.0, 0.0, None, false, 0.0, 0.0))
+                });
+
+            if fully_collapsed {
+                return s.width(full_width).height_full().display(floem::style::Display::None);
+            }
+
+            // Keep the content at the pane's full logical width so that
+            // text layout is never recalculated during the animation.
+            let base = s.width(full_width).height_full();
+
+            // Compute a translate_x that keeps content visually anchored
+            // while the tab sweeps across it. The approach differs by side:
+            //
+            // Right-stacking: render_x = x + collapse_width, so content
+            //   shifts by -collapse_width to stay at screen position x.
+            //
+            // Left-stacking: render_x = x (which is animating leftward).
+            //   We derive the pane's traveled x-distance from collapse
+            //   progress (both use the same easing) and compensate so the
+            //   content appears stationary in screen space.
+            match collapse_side {
+                Some(StackSide::Right) => base.translate_x(-collapse_width),
+                Some(StackSide::Left) => {
+                    let remaining_collapse = full_width - PEEK_WIDTH - collapse_width;
+                    let translate = if remaining_collapse > ANIM_SNAP {
+                        -collapse_width * (target_x - x) / remaining_collapse
+                    } else {
+                        0.0
+                    };
+                    base.translate_x(translate)
+                }
+                None => base,
             }
         });
 
     // --- Tab overlay ---
-    // Shown only when the pane is stacked. Displays the same label as the
-    // header, rotated sideways to fit the narrow PEEK_WIDTH strip.
-    // Uses a static snapshot since the tab is just a visual indicator.
+    // Visible during the collapse/expand animation and when fully stacked.
+    // During the animation the tab is a PEEK_WIDTH strip at the leading
+    // edge of the collapse (opposite the stack direction), giving the
+    // appearance of sweeping across the content.
     let tab_content = pane_label_content(channel_id_opt, channels, servers, false);
     let tab_overlay = Stack::horizontal((tab_content,))
         .style(move |s| {
             ctx.anim_tick.get();
-            // Left-stacked reads bottom-to-top (-90°),
-            // right-stacked reads top-to-bottom (+90°).
-            let side = ctx.panes.with_untracked(|ps| {
+            // Rotation direction and text alignment are based on collapse_side
+            // so they persist through the expand animation after stack_side
+            // is cleared.
+            let pane_height = ctx.panes.with_untracked(|ps| {
                 ps.iter()
                     .find(|p| p.id == pane_id)
-                    .and_then(|p| p.stack_side)
+                    .map(|p| p.display_height())
+                    .unwrap_or(0.0)
             });
-            let angle = match side {
-                Some(StackSide::Right) => 90.0,
-                _ => -90.0,
+
+            // The inner element is laid out as a wide horizontal strip
+            // (width = pane_height) then rotated +90° into the narrow
+            // vertical tab. Left-aligned content maps to the visual top
+            // after rotation, so the icon naturally sits at the top of
+            // the strip for both stacking sides. The `rotate_about` pivot
+            // is chosen so the rotated bounding box lands exactly within
+            // (0, 0, PEEK_WIDTH, pane_height).
+            let ph = pane_height.max(1.0);
+            let anchor = AnchorAbout {
+                x: PEEK_WIDTH / (2.0 * ph),
+                y: 0.5,
             };
-            // `.rotate(angle.deg())` applies a CSS-like rotation transform.
-            s.items_center().rotate(angle.deg())
+            s.absolute()
+                .inset_left(0.0)
+                .inset_top(0.0)
+                .width(ph)
+                .height(PEEK_WIDTH)
+                .items_center()
+                .justify_start()
+                .padding_left(12.0)
+                .rotate(90.0_f64.deg())
+                .rotate_about(anchor)
         })
         .container()
         .style(move |s| {
             ctx.anim_tick.get();
-            let side = ctx.panes.with_untracked(|ps| {
+            let (collapse_side, collapse_width, full_width) = ctx.panes.with_untracked(|ps| {
                 ps.iter()
                     .find(|p| p.id == pane_id)
-                    .and_then(|p| p.stack_side)
+                    .map(|p| (p.collapse_side, p.collapse_width, p.width))
+                    .unwrap_or((None, 0.0, 0.0))
             });
-            // Fill the entire pane area (which is shrunk to PEEK_WIDTH when stacked).
-            let base = s
-                .absolute()
+            let is_visible = collapse_side.is_some() && collapse_width > 0.0;
+            if !is_visible {
+                return s.display(floem::style::Display::None);
+            }
+            // PEEK_WIDTH strip positioned at the leading edge of the collapse.
+            // Both sides use inset_left with a computed offset — inset_right
+            // doesn't reliably position elements in floem's layout engine.
+            let tab_left = match collapse_side {
+                Some(StackSide::Left) => full_width - collapse_width - PEEK_WIDTH,
+                _ => 0.0,
+            };
+            s.absolute()
                 .inset_top(0.0)
                 .inset_bottom(0.0)
-                .inset_left(0.0)
-                .inset_right(0.0)
-                .items_center()
-                .justify_center()
+                .inset_left(tab_left)
+                .width(PEEK_WIDTH)
                 .background(theme::PANE_HEADER_BG)
                 .border_radius(8.0)
-                .cursor(CursorStyle::Pointer);
-            match side {
-                Some(_) => base, // visible when stacked
-                None => base.display(floem::style::Display::None), // hidden when fully visible
-            }
+                .cursor(CursorStyle::Pointer)
         })
         // Clicking a stacked tab focuses that pane (scrolls it into view).
         .on_event_stop(listener::PointerDown, move |_, _| {
@@ -791,9 +834,8 @@ pub fn pane_card(
     let top_left_handle = resize_handle(pane_id, ResizeEdge::TopLeft, ctx.resizing);
     let top_right_handle = resize_handle(pane_id, ResizeEdge::TopRight, ctx.resizing);
 
-    // --- Outer container ---
-    // `Stack::new(tuple)` creates a stack that can hold mixed view types.
-    // Positioned absolutely using the pane's animated x/y coordinates.
+    // --- Inner container ---
+    // Holds all visual elements; caller wraps with positioning as needed.
     Stack::new((
         clipped_content,
         left_handle,
@@ -803,6 +845,329 @@ pub fn pane_card(
         top_right_handle,
         tab_overlay,
     ))
+        .clip()
+        .style(move |s| {
+            s.width_full()
+                .height_full()
+                .background(bg)
+                .border_radius(8.0)
+                .border(1.0)
+                .border_color(theme::PANE_BORDER)
+        })
+        // --- Native multi-window: handle drag and resize via per-window PointerMove ---
+        // In single-window mode, the root PointerMove handler (paned.rs) drives
+        // drag/resize. In native mode, each pane window handles its own events
+        // and repositions windows via the animation system.
+        .on_event_cont(listener::PointerMove, move |_, event| {
+            if !ctx.is_native_mode() {
+                return;
+            }
+            let pos = event.current.logical_point();
+
+            // --- Resize ---
+            if let Some(mut rz) = ctx.resizing.get_untracked() {
+                if rz.pane_id != pane_id {
+                    return;
+                }
+                let has_prev = rz.last_x.is_some() || rz.last_y.is_some();
+                if has_prev {
+                    let dx = rz.last_x.map(|lx| pos.x - lx).unwrap_or(0.0);
+                    let dy = rz.last_y.map(|ly| pos.y - ly).unwrap_or(0.0);
+                    let (ww, _) = ctx.window_size.get_untracked();
+                    ctx.panes.update(|p| {
+                        if let Some(pane) = p.iter_mut().find(|ps| ps.id == rz.pane_id) {
+                            let min_w = pane.min_resize_width();
+                            match rz.edge {
+                                ResizeEdge::Right | ResizeEdge::TopRight => {
+                                    pane.width = (pane.width + dx).max(min_w);
+                                }
+                                ResizeEdge::Left | ResizeEdge::TopLeft => {
+                                    let new_w = (pane.width - dx).max(min_w);
+                                    let delta = pane.width - new_w;
+                                    pane.x += delta;
+                                    pane.width = new_w;
+                                }
+                                ResizeEdge::Top => {}
+                            }
+                            match rz.edge {
+                                ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight => {
+                                    let new_h = (pane.height - dy).max(MIN_PANE_HEIGHT);
+                                    if !pane.docked {
+                                        let actual_dy = pane.height - new_h;
+                                        pane.y += actual_dy;
+                                    }
+                                    pane.height = new_h;
+                                }
+                                _ => {}
+                            }
+                        }
+                        let mut no_hysteresis = None;
+                        recompute_targets_during_drag(p, rz.pane_id, ww, &mut no_hysteresis);
+                        if let Some(pane) = p.iter_mut().find(|ps| ps.id == rz.pane_id) {
+                            pane.target_x = pane.x;
+                        }
+                    });
+                    ctx.anim_tick.set(ctx.anim_tick.get_untracked() + 1);
+                    ctx.start_animation();
+                }
+                rz.last_x = Some(pos.x);
+                rz.last_y = Some(pos.y);
+                ctx.resizing.set(Some(rz));
+                return;
+            }
+
+            // --- Drag ---
+            // In native mode, the dragged pane's window is moved directly
+            // here (not by the animation loop) so the local pointer
+            // coordinates stay consistent. We record last_pointer only
+            // once (first PointerMove) and never update it: each
+            // set_window_inner_bounds shifts the local coordinate frame
+            // by exactly the delta, so the stored baseline stays correct.
+            if let Some(mut drag) = ctx.dragging.get_untracked() {
+                if drag.pane_id != pane_id {
+                    return;
+                }
+                let is_stacked = ctx.panes.with_untracked(|p| {
+                    p.iter()
+                        .find(|ps| ps.id == drag.pane_id)
+                        .is_some_and(|ps| ps.stack_side.is_some())
+                });
+                if is_stacked {
+                    if drag.last_pointer_x.is_none() {
+                        drag.last_pointer_x = Some(pos.x);
+                        drag.last_pointer_y = Some(pos.y);
+                        ctx.dragging.set(Some(drag));
+                    }
+                    return;
+                }
+
+                // First PointerMove: record the baseline, no delta yet.
+                if drag.last_pointer_x.is_none() {
+                    drag.start_pointer_x = pos.x;
+                    drag.start_pointer_y = pos.y;
+                    drag.last_pointer_x = Some(pos.x);
+                    drag.last_pointer_y = Some(pos.y);
+                    ctx.dragging.set(Some(drag));
+                    return;
+                }
+                let (lx, ly) = (drag.last_pointer_x.unwrap(), drag.last_pointer_y.unwrap());
+                let dx = pos.x - lx;
+                let dy = pos.y - ly;
+                if !drag.moved {
+                    let dist = (pos.x - drag.start_pointer_x).abs()
+                        + (pos.y - drag.start_pointer_y).abs();
+                    if dist < DRAG_DEAD_ZONE {
+                        return;
+                    }
+                    drag.moved = true;
+                }
+                let (ww, wh) = ctx.window_size.get_untracked();
+                let is_browser_docked = ctx.panes.with_untracked(|p| {
+                    p.iter()
+                        .find(|ps| ps.id == drag.pane_id)
+                        .map_or(false, |ps| matches!(ps.kind, PaneKind::Browser) && ps.docked)
+                });
+                ctx.panes.update(|p| {
+                    if let Some(pane) = p.iter_mut().find(|ps| ps.id == drag.pane_id) {
+                        if !is_browser_docked {
+                            pane.x += dx;
+                            pane.target_x = pane.x;
+                        }
+                        if pane.docked {
+                            let dock_y = pane.dock_y(wh);
+                            if pane.y < dock_y - UNDOCK_THRESHOLD {
+                                pane.y = dock_y;
+                            }
+                            pane.y += dy;
+                            if dock_y - pane.y > UNDOCK_THRESHOLD {
+                                pane.docked = false;
+                            } else {
+                                pane.y = pane.y.min(dock_y);
+                            }
+                        } else {
+                            pane.y += dy;
+                            let dock_y = pane.dock_y(wh);
+                            if pane.y >= dock_y - PANE_SPACING {
+                                pane.docked = true;
+                                pane.y = dock_y;
+                            }
+                        }
+                    }
+                    if !is_browser_docked {
+                        recompute_targets_during_drag(p, drag.pane_id, ww, &mut drag.last_insert_pos);
+                    }
+                });
+                // Move the dragged window immediately (the animation loop
+                // skips it to avoid coordinate-frame conflicts).
+                reposition_single_window(ctx, drag.pane_id);
+                ctx.anim_tick.set(ctx.anim_tick.get_untracked() + 1);
+                ctx.start_animation();
+                // Don't update last_pointer — the window move shifts
+                // local coords by exactly the delta, keeping the
+                // baseline correct for the next frame.
+                ctx.dragging.set(Some(drag));
+            }
+        })
+        // --- Native multi-window: finalize drag or resize on pointer up ---
+        .on_event_cont(listener::PointerUp, move |_, _| {
+            if !ctx.is_native_mode() {
+                return;
+            }
+            // Resize end.
+            if let Some(rz) = ctx.resizing.get_untracked() {
+                if rz.pane_id == pane_id {
+                    let (ww, _) = ctx.window_size.get_untracked();
+                    let fid = ctx.focus_pane_id.get_untracked();
+                    ctx.panes.update(|p| recompute_dock_targets(p, ww, fid));
+                    ctx.resizing.set(None);
+                    ctx.start_animation();
+                    return;
+                }
+            }
+            // Drag end.
+            if let Some(drag) = ctx.dragging.get_untracked() {
+                if drag.pane_id != pane_id {
+                    return;
+                }
+                if drag.moved {
+                    let (ww, wh) = ctx.window_size.get_untracked();
+                    ctx.focus_pane_id.set(Some(drag.pane_id));
+                    ctx.panes.update(|p| {
+                        // Snap-to-dock if near bottom edge.
+                        if let Some(pane) = p.iter_mut().find(|ps| ps.id == drag.pane_id) {
+                            if !pane.docked {
+                                let dock_y = pane.dock_y(wh);
+                                if pane.y >= dock_y - UNDOCK_THRESHOLD {
+                                    pane.docked = true;
+                                    pane.y = dock_y;
+                                }
+                            }
+                        }
+                        commit_drag_order(p, drag.pane_id);
+                        recompute_dock_targets(p, ww, Some(drag.pane_id));
+                    });
+                } else {
+                    // Click (no movement) — same collapse/focus logic as paned.rs.
+                    handle_pane_click(pane_id, &drag, ctx);
+                }
+                ctx.dragging.set(None);
+                ctx.start_animation();
+            }
+        })
+        // --- Close this pane with Cmd-W / Ctrl-W ---
+        // The editor lets unhandled key combos bubble, so Cmd-W arrives
+        // here even when a text input has focus.
+        //
+        // Uses on_event_cont so the event keeps bubbling in single-
+        // window mode — the root view in paned.rs handles it there.
+        // In native mode this IS the window root, so there's nothing
+        // above to propagate to.
+        .style(move |s| {
+            if ctx.is_native_mode() {
+                s.keyboard_navigable()
+            } else {
+                s
+            }
+        })
+        .on_event_cont(listener::KeyDown, move |_, KeyboardEvent { key, modifiers, .. }| {
+            if !ctx.is_native_mode() {
+                return;
+            }
+            #[cfg(target_os = "macos")]
+            let close_mod = Modifiers::META;
+            #[cfg(not(target_os = "macos"))]
+            let close_mod = Modifiers::CONTROL;
+
+            if *key == Key::Character("w".into()) && modifiers.contains(close_mod) {
+                on_close();
+            }
+        })
+}
+
+/// Handle a click (non-drag) on a pane header in native mode.
+/// Mirrors the logic in `paned.rs`'s PointerUp handler.
+fn handle_pane_click(pane_id: usize, drag: &DragInfo, ctx: PaneCtx) {
+    let is_stacked = ctx.panes
+        .get_untracked()
+        .iter()
+        .find(|p| p.id == pane_id)
+        .is_some_and(|p| p.stack_side.is_some());
+
+    if is_stacked {
+        ctx.focus_pane_id.set(Some(pane_id));
+        let (ww, _) = ctx.window_size.get_untracked();
+        ctx.panes.update(|p| {
+            recompute_dock_targets(p, ww, Some(pane_id));
+        });
+    } else if drag.was_focused {
+        let (ww, wh) = ctx.window_size.get_untracked();
+        ctx.panes.update(|p| {
+            if let Some(pane) = p.iter_mut().find(|ps| ps.id == pane_id) {
+                pane.collapsed = !pane.collapsed;
+                if pane.collapsed {
+                    pane.uncollapsed_width = pane.width;
+                    pane.width = COLLAPSED_PANE_WIDTH.min(pane.width);
+                } else if pane.uncollapsed_width > 0.0 {
+                    pane.width = pane.uncollapsed_width;
+                    pane.uncollapsed_width = 0.0;
+                }
+                if pane.docked {
+                    pane.y = pane.dock_y(wh);
+                }
+            }
+            recompute_dock_targets(p, ww, Some(pane_id));
+        });
+    } else {
+        let cid = ctx.panes.with_untracked(|p| {
+            p.iter()
+                .find(|ps| ps.id == pane_id)
+                .and_then(|ps| ps.kind.channel_id())
+        });
+        if let Some(cid) = cid {
+            if let Some(trigger) =
+                ctx.focus_triggers.with_untracked(|m| m.get(&cid).copied())
+            {
+                trigger.update(|v| *v += 1);
+            }
+        }
+    }
+}
+
+/// A complete pane card: header + content + resize handles + tab overlay,
+/// wrapped in an absolutely-positioned container for the single-window mode.
+///
+/// This is the main view factory called by `dyn_stack` in `paned.rs` for
+/// each open pane. It delegates to [`pane_content`] for the inner content
+/// and adds the absolute positioning + z-index wrapper that places the
+/// pane at its animated `(x, y)` coordinates within the single window.
+///
+/// ## Signal subscription strategy
+///
+/// The outer style closure reads `anim_tick.get()` (a cheap u64) to
+/// subscribe to animation updates, then uses `panes.with_untracked()` to
+/// borrow the actual PaneState data without cloning. This is critical for
+/// performance — cloning `Vec<PaneState>` on every animation frame (60fps)
+/// would be wasteful.
+pub fn pane_card(
+    pane_id: usize,
+    kind: PaneKind,
+    servers: RwSignal<Vec<Server>>,
+    channels: RwSignal<Vec<Channel>>,
+    messages: RwSignal<HashMap<usize, Vec<Message>>>,
+    next_message_id: RwSignal<usize>,
+    active_server: RwSignal<usize>,
+    ctx: PaneCtx,
+) -> impl IntoView {
+    let inner = pane_content(
+        pane_id, kind, servers, channels, messages,
+        next_message_id, active_server, ctx,
+    );
+
+    // Wrap the shared pane content in an absolute-positioning container
+    // that places the card at its animated screen position within the
+    // single parent window.
+    inner
+        .container()
         .style(move |s| {
             // Subscribe to the lightweight tick counter rather than the full
             // pane Vec — avoids cloning and diffing every animation frame.
@@ -818,10 +1183,6 @@ pub fn pane_card(
                     .inset_top(p.render_top(wh))
                     .width(p.render_width())
                     .height(p.display_height())
-                    .background(bg)
-                    .border_radius(8.0)
-                    .border(1.0)
-                    .border_color(theme::PANE_BORDER)
                     .z_index(p.z_order)
             } else {
                 // Pane was removed — hide this view until dyn_stack removes it.
